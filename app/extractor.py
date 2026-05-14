@@ -7,6 +7,22 @@ from typing import Optional
 from pypdf import PdfReader
 
 
+GERMAN_MONTHS = {
+    "januar": 1, "jan": 1,
+    "februar": 2, "feb": 2,
+    "märz": 3, "maerz": 3, "mrz": 3,
+    "april": 4, "apr": 4,
+    "mai": 5,
+    "juni": 6, "jun": 6,
+    "juli": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9,
+    "oktober": 10, "okt": 10,
+    "november": 11, "nov": 11,
+    "dezember": 12, "dez": 12,
+}
+
+
 def extract_text(file_path: str, content_type: str) -> str:
     path = Path(file_path)
 
@@ -36,6 +52,8 @@ def extract_text(file_path: str, content_type: str) -> str:
 
 
 def _parse_decimal(value: str) -> Optional[Decimal]:
+    value = value.strip()
+    value = value.replace("€", "").replace("EUR", "").strip()
     cleaned = value.replace(".", "").replace(",", ".")
     try:
         return Decimal(cleaned).quantize(Decimal("0.01"))
@@ -44,6 +62,7 @@ def _parse_decimal(value: str) -> Optional[Decimal]:
 
 
 def find_date(text: str):
+    # 08.05.2026, 2026-05-08, 08/05/2026
     patterns = [
         r"(\d{2}\.\d{2}\.\d{4})",
         r"(\d{4}-\d{2}-\d{2})",
@@ -59,24 +78,59 @@ def find_date(text: str):
                 return datetime.strptime(value, fmt).date()
             except ValueError:
                 pass
+
+    # 08. Mai 2026 / 8 Mai 2026
+    match = re.search(
+        r"\b(\d{1,2})\.?:?\s+([A-Za-zÄÖÜäöüß]+)\s+(\d{4})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        day = int(match.group(1))
+        month_name = match.group(2).lower().replace("ä", "ae")
+        year = int(match.group(3))
+        month = GERMAN_MONTHS.get(month_name)
+        if month:
+            try:
+                return datetime(year, month, day).date()
+            except ValueError:
+                return None
     return None
 
 
 def find_invoice_number(text: str) -> Optional[str]:
     patterns = [
-        r"(?:Rechnungsnummer|Rechnung Nr\.?|Invoice No\.?|Invoice Number|Belegnummer)[:\s#-]*([A-Z0-9\-/]+)",
+        r"(?:Rechnung\s*#|Rechnungsnummer|Rechnung\s*Nr\.?|Invoice\s*No\.?|Invoice\s*Number|Belegnummer)[:\s#-]*([A-Z0-9\-/]+)",
         r"(?:Rechnung|Invoice)[:\s#-]*([A-Z0-9\-/]{4,})",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            return match.group(1).strip().lstrip("#")
     return None
+
+
+def _amount_regex() -> str:
+    # erkennt 50,00 / 1.250,00 mit optionalem € vor oder nach dem Betrag
+    return r"(?:€\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})\s*(?:€|EUR)?"
 
 
 def find_amount(text: str, labels: list[str]) -> Optional[Decimal]:
     for label in labels:
-        pattern = rf"{label}[^\d]{{0,30}}(\d{{1,3}}(?:\.\d{{3}})*,\d{{2}}|\d+,\d{{2}})\s?(?:€|EUR)?"
+        pattern = rf"{label}[^\n\d€]{{0,40}}{_amount_regex()}"
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return _parse_decimal(match.group(1))
+    return None
+
+
+def find_vat(text: str) -> Optional[Decimal]:
+    # Beispiel: MwSt. 7% €3,27 oder VAT 19% 11,17 EUR
+    patterns = [
+        rf"(?:MwSt\.?|USt\.?|Umsatzsteuer|VAT|Tax)[^\n]{{0,60}}{_amount_regex()}",
+        rf"(?:7%|19%)[^\n]{{0,30}}{_amount_regex()}",
+    ]
+    for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return _parse_decimal(match.group(1))
@@ -84,7 +138,7 @@ def find_amount(text: str, labels: list[str]) -> Optional[Decimal]:
 
 
 def find_largest_amount(text: str) -> Optional[Decimal]:
-    values = re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})\s?(?:€|EUR)?", text)
+    values = re.findall(_amount_regex(), text)
     decimals = [_parse_decimal(v) for v in values]
     decimals = [d for d in decimals if d is not None]
     return max(decimals) if decimals else None
@@ -92,8 +146,16 @@ def find_largest_amount(text: str) -> Optional[Decimal]:
 
 def find_vendor(text: str) -> Optional[str]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    bad_keywords = ["rechnung", "invoice", "datum", "seite", "betrag", "summe", "total"]
-    for line in lines[:12]:
+    legal_forms = ["gmbh", "ug", "gbr", "ag", "kg", "ohg", "e.k", "mbh", "ltd"]
+
+    # bevorzugt echte Firmenzeile statt Domain/Shop-Zeile
+    for line in lines[:20]:
+        lower = line.lower()
+        if any(form in lower for form in legal_forms):
+            return line
+
+    bad_keywords = ["rechnung", "invoice", "datum", "seite", "betrag", "summe", "total", "shop", "www", ".de", ".com"]
+    for line in lines[:15]:
         if len(line) < 3 or len(line) > 80:
             continue
         lower = line.lower()
@@ -105,11 +167,14 @@ def find_vendor(text: str) -> Optional[str]:
 
 
 def extract_fields(text: str) -> dict:
-    gross = find_amount(text, ["Gesamtbetrag", "Bruttobetrag", "Summe", "Total", "Amount due", "Zu zahlen"])
+    gross = find_amount(text, [
+        "Gesamtsumme", "Gesamtbetrag", "Gesamtpreis", "Bruttobetrag", "Rechnungssumme",
+        "Summe", "Total", "Amount due", "Zu zahlen"
+    ])
     if gross is None:
         gross = find_largest_amount(text)
 
-    vat = find_amount(text, ["MwSt", "USt", "Umsatzsteuer", "VAT", "Tax"])
+    vat = find_vat(text)
 
     return {
         "invoice_date": find_date(text),
