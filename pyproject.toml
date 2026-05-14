@@ -1,0 +1,16 @@
+[project]
+name = "ki-belegassistent-mvp"
+version = "0.1.0"
+description = "KI-Belegassistent MVP"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi>=0.110.0",
+  "uvicorn[standard]>=0.27.0",
+  "jinja2>=3.1.0",
+  "python-multipart>=0.0.9",
+  "sqlalchemy>=2.0.0",
+  "pydantic>=2.0.0",
+  "pymupdf>=1.23.0",
+  "pillow>=10.0.0",
+  "pytesseract>=0.3.10"
+]
