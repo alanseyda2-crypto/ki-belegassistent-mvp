@@ -1,7 +1,0 @@
-{
-  "provider": "python",
-  "commands": {
-    "install": "pip install --upgrade pip && pip install -r requirements.txt",
-    "start": "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
-  }
-}
