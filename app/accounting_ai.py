@@ -57,7 +57,7 @@ def rule_based_skr03(text: str, vendor: Optional[str], vat_rate: Optional[Decima
         (["bürobedarf", "papier", "drucker", "toner", "stift", "notiz", "amazon business"], "Bürobedarf", "4930", "Bürobedarf"),
         (["bewirtung", "restaurant", "cafe", "café", "bäckerei", "essen", "lieferando"], "Bewirtung", "4650", "Bewirtungskosten"),
         (["hotel", "booking.com", "reise", "bahn", "db fernverkehr", "flug", "lufthansa"], "Reisekosten", "4660", "Reisekosten"),
-        (["aral", "shell", "esso", "total", "tankstelle", "kraftstoff", "diesel", "benzin"], "Kfz-Kosten", "4530", "Kfz-Betriebskosten"),
+        (["aral", "shell", "esso", "total", "totalenergies", "hem", "tankstelle", "kraftstoff", "diesel", "benzin", "säule", "saeule"], "Kfz-Kosten", "4530", "Kfz-Betriebskosten"),
         (["ware", "waren", "artikel", "produkt", "shop", "einkauf", "schwarzkümmelöl", "patch", "patches"], "Wareneinkauf", "3300" if vat_rate == Decimal("7.00") else "3400", "Wareneinkauf"),
         (["versicherung", "allianz", "huk", "axa"], "Versicherung", "4360", "Versicherungsbeitrag"),
         (["miete", "pacht", "bürofläche", "gewerberaum"], "Miete/Pacht", "4210", "Miete/Pacht"),
