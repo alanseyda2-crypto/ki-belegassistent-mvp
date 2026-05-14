@@ -1,4 +1,7 @@
 import re
+import os
+import json
+import base64
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from pathlib import Path
@@ -163,21 +166,51 @@ def find_date(text: str):
 
 
 def find_invoice_number(text: str) -> Optional[str]:
-    patterns = [
-        r"(?:Rechnung\s*#|Rechnungsnummer|Rechnung\s*Nr\.?|Invoice\s*No\.?|Invoice\s*Number|Belegnummer|Beleg-Nr\.?|Beleg\s*Nr\.?)[:\s#-]*([A-Z0-9\-/]+)",
-        r"(?:Bon|Kassenbon|Transaktions-Nr\.?|Bon-Nr\.?)[:\s#-]*([A-Z0-9\-/]+)",
-        r"(?:Rechnung|Invoice)[:\s#-]*([A-Z0-9\-/]{4,})",
+    """Nur echte Rechnungsnummern zuverlässig übernehmen.
+
+    Bei Kassenbons stehen viele Nummern (Terminal, Trace, TSE, Beleg-Nr.). Diese sind
+    meistens keine Rechnungsnummer und verwirren den DATEV-Export. Daher bei reinen
+    Kassenbons lieber leer lassen, außer es gibt ein klares Rechnung/Rechnungsnummer-Label.
+    """
+    invoice_patterns = [
+        r"(?:Rechnung\s*#|Rechnungsnummer|Rechnung\s*Nr\.?|Invoice\s*No\.?|Invoice\s*Number)[:\s#-]*([A-Z0-9\-/]{4,})",
     ]
-    for pattern in patterns:
+    for pattern in invoice_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return match.group(1).strip().lstrip("#")
-    return None
 
+    # Nur sehr explizite Bonnummer übernehmen, nicht kurze Terminal-/Trace-Werte.
+    explicit_receipt_patterns = [
+        r"(?:Bonnummer|Kassenbonnummer|Belegnummer)[:\s#-]*([A-Z0-9\-/]{5,})",
+    ]
+    for pattern in explicit_receipt_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip().lstrip("#")
+            if not candidate.isdigit() or len(candidate) >= 6:
+                return candidate
+    return None
 
 def _amount_regex() -> str:
     return r"(?:€\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[,\.]\d{2})\s*(?:€|EUR|EÜR)?"
 
+
+
+
+def _loose_money_values(line: str) -> list[Decimal]:
+    """Erkennt auch OCR-Formate wie '2 49' oder '75 57' als Geldbeträge."""
+    vals = _amounts_in_line(line)
+    # Nur bei Beleg-/Summen-/Zahlungs-Kontext lockere Erkennung verwenden.
+    if re.search(r"\b(summe|total|gesamt|bar|karte|mastercard|visa|brutto|betrag|eur)\b", line, re.IGNORECASE):
+        for a, b in re.findall(r"\b(\d{1,4})\s+(\d{2})\b", line):
+            try:
+                d = Decimal(f"{a}.{b}").quantize(Decimal("0.01"))
+                if d not in vals:
+                    vals.append(d)
+            except Exception:
+                pass
+    return vals
 
 def _amounts_in_line(line: str) -> list[Decimal]:
     found = re.findall(_amount_regex(), line, flags=re.IGNORECASE)
@@ -225,65 +258,62 @@ def _line_context(lines: list[str], index: int, before: int = 1, after: int = 2)
 def find_receipt_total(text: str) -> Optional[Decimal]:
     """Robuste Speziallogik für Handyfotos, Kassenbons und Tankbelege.
 
-    Priorität: explizite Brutto-/Total-/Kartenzahlung-Zeilen. Liter, Literpreise,
-    MwSt-Sätze, Netto-Beträge und einzelne Steuersätze werden konsequent ignoriert.
+    Priorität: SUMME/TOTAL/GESAMT, Bar/Karte/MasterCard/Visa und Steuer-Tabellen
+    mit BRUTTO-Spalte. Liter, Literpreise, Steuerbeträge, Netto und Nummern werden ignoriert.
     """
     text = _normalize_ocr_text(text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     candidates: list[tuple[int, Decimal]] = []
 
-    strong_total = ["total", "gesamtsumme", "gesamtbetrag", "gesamtpreis", "summe", "zu zahlen", "brutto"]
-    payment_words = ["kartenzahlung", "mastercard", "visa", "girocard", "ec-karte", "debit", "kreditkarte", "karte"]
-    ignore_words = ["liter", "eur/l", "eur / l", "l/", "stk", "menge", "einzelpreis", "netto"]
+    ignore_words = ["liter", "eur/l", "eur / l", "l/", "stk", "menge", "einzelpreis", "netto", "mwst", "ust", "steuer", "tse", "terminal", "trace", "seriennr"]
+    total_words = ["summe", "total", "gesamtsumme", "gesamtbetrag", "gesamtpreis", "zu zahlen", "endbetrag"]
+    payment_words = ["bar", "kartenzahlung", "mastercard", "visa", "girocard", "ec-karte", "debit", "kreditkarte", "karte"]
 
-    # 1) Wenn eine Zeile BRUTTO enthält, Wert direkt nach BRUTTO bevorzugen.
-    for line in lines:
-        lower = line.lower()
-        m = re.search(r"brutto[^0-9]{0,25}" + _amount_regex(), line, re.IGNORECASE)
-        if m:
-            val = _parse_decimal(m.group(1))
-            if val and _is_likely_money_amount(val) and val not in [Decimal("7.00"), Decimal("19.00")]:
-                candidates.append((260 + min(int(val), 80), val))
-
-    # 2) Explizite Total-/Gesamt-/Zahlungszeilen. Bei mehreren Zahlen meist letzte/groesste Zahl.
+    # 1) Sehr starke Regel: SUMME/TOTAL/GESAMT-Zeile plus Folgezeilen. Nicht in Steuer-/TSE-Blöcken suchen.
     for i, line in enumerate(lines):
         lower = line.lower()
-        has_total = any(k in lower for k in strong_total)
-        has_payment = any(k in lower for k in payment_words)
-        has_betrag = bool(re.search(r"\bbetrag\b", lower))
-        if not (has_total or has_payment or has_betrag):
-            continue
-        # Nächste Zeile mitnehmen, weil OCR Betrag manchmal in Folgezeile setzt.
-        window = _line_context(lines, i, before=0, after=1)
-        vals = _amounts_in_line(window)
-        for val in vals:
-            if not _is_likely_money_amount(val) or val in [Decimal("7.00"), Decimal("19.00")]:
-                continue
-            score = 0
-            if has_total:
-                score += 210
-            if "brutto" in lower:
-                score += 230
-            if has_payment:
-                score += 170
-            if has_betrag:
-                score += 120
-            if any(w in lower for w in ignore_words):
-                score -= 180
-            if "mwst" in lower or "ust" in lower or "steuer" in lower:
-                score -= 130
-            if "netto" in lower and "brutto" not in lower:
-                score -= 160
-            # Höhere Bruttowerte innerhalb derselben Zeile leicht bevorzugen.
-            score += min(int(val), 80)
-            candidates.append((score, val))
+        if any(w in lower for w in total_words):
+            window_lines = lines[i:i+4]
+            for j, wline in enumerate(window_lines):
+                wl = wline.lower()
+                if any(x in wl for x in ["mwst", "ust", "steuer", "netto", "tse", "terminal", "transaktion"]):
+                    continue
+                vals = _loose_money_values(wline)
+                vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
+                for v in vals:
+                    candidates.append((400 - j * 10 + min(int(v), 80), v))
 
-    # 3) Muster: NETTO x MWST y BRUTTO z oder NETTO x BRUTTO z.
-    brutto_matches = re.finditer(r"brutto[^0-9]{0,25}" + _amount_regex(), text, re.IGNORECASE)
-    for m in brutto_matches:
+    # 2) Zahlungszeilen: Bar EUR 2,49 / Mastercard 75,57 / Kartenzahlung 75,57.
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if any(w in lower for w in payment_words) or re.search(r"\bbetrag\b", lower):
+            if any(x in lower for x in ["mwst", "ust", "steuer", "netto", "tse", "terminal", "transaktion", "folge"]):
+                continue
+            window = " ".join(lines[i:i+2])
+            vals = _loose_money_values(window)
+            vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
+            for v in vals:
+                score = 330 + min(int(v), 80)
+                if "bar" in lower or "mastercard" in lower or "visa" in lower:
+                    score += 40
+                candidates.append((score, v))
+
+    # 3) Steuer-Tabelle: Header enthält MWST/BRUTTO/NETTO; Brutto ist meist der mittlere/groessere Wert.
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if "brutto" in lower and ("mwst" in lower or "ust" in lower or "netto" in lower):
+            window = " ".join(lines[i:i+3])
+            vals = _loose_money_values(window)
+            vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
+            # Typisch: MwSt, Brutto, Netto -> Brutto ist der größte Wert, aber nicht immer.
+            if vals:
+                candidates.append((300 + min(int(max(vals)), 80), max(vals)))
+
+    # 4) Explizites BRUTTO-Muster.
+    for m in re.finditer(r"brutto[^0-9]{0,30}" + _amount_regex(), text, re.IGNORECASE):
         val = _parse_decimal(m.group(1))
         if val and _is_likely_money_amount(val) and val not in [Decimal("7.00"), Decimal("19.00")]:
-            candidates.append((240 + min(int(val), 80), val))
+            candidates.append((280 + min(int(val), 80), val))
 
     if candidates:
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -317,32 +347,31 @@ def find_vat(text: str) -> Optional[Decimal]:
     text = _normalize_ocr_text(text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # Direktmuster auf MwSt-Zeilen: "MWST 19,00% A 12,07 EUR".
+    # 1) Steuer-Tabelle mit Spalten MWST / BRUTTO / NETTO.
+    # Beispiel Netto: Header "MWST BRUTTO NETTO", Folgezeile "b 7% 0,16 2,49 2,33".
     for i, line in enumerate(lines):
         lower = line.lower()
-        if not any(k in lower for k in ["mwst", "ust", "umsatzsteuer", "vat", "tax"]):
-            continue
-        if "netto" in lower and "brutto" in lower and "mwst" not in lower:
-            continue
-        window = _line_context(lines, i, before=0, after=0)
-        vals = _amounts_in_line(window)
-        vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
-        if vals:
-            # Steuerbetrag ist auf MwSt-Zeilen meist der letzte Geldwert.
-            return vals[-1]
+        if ("mwst" in lower or "ust" in lower) and "brutto" in lower and "netto" in lower:
+            window = " ".join(lines[i:i+3])
+            vals = _loose_money_values(window)
+            vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
+            if len(vals) >= 3:
+                # Kleinster Betrag ist in diesen Tabellen fast immer Steuerbetrag.
+                return min(vals)
+            if vals:
+                return min(vals)
 
-    # Wenn Steuerbetrag in der Folgezeile steht, maximal eine Zeile weiter suchen.
+    # 2) Direktmuster auf MwSt-Zeilen: "MWST 19,00% A 12,07 EUR".
     for i, line in enumerate(lines):
         lower = line.lower()
         if not any(k in lower for k in ["mwst", "ust", "umsatzsteuer", "vat", "tax"]):
             continue
         window = _line_context(lines, i, before=0, after=1)
-        # Nicht die Netto-/Brutto-Zeile als Steuerbetrag nehmen.
-        window = " ".join([part for part in window.split("  ") if "netto" not in part.lower() and "brutto" not in part.lower()])
-        vals = _amounts_in_line(window)
+        vals = _loose_money_values(window)
         vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
         if vals:
-            return vals[-1]
+            # Bei Steuerzeilen ist Steuerbetrag plausibel der kleinste Betrag < Brutto.
+            return min(vals)
 
     patterns = [
         rf"(?:MwSt\.?|USt\.?|Umsatzsteuer|VAT|Tax)[^\n]{{0,80}}{_amount_regex()}",
@@ -413,6 +442,8 @@ def find_vendor(text: str) -> Optional[str]:
         ("rossmann", "Rossmann"),
         ("ikea", "IKEA"),
         ("amazon", "Amazon"),
+        ("netto", "Netto Marken-Discount"),
+        ("marken-discount", "Netto Marken-Discount"),
     ]
     for needle, name in known:
         if needle in full_lower:
@@ -452,7 +483,176 @@ def suggest_booking(text: str, vendor: Optional[str], vat_rate: Optional[Decimal
     return rule_result
 
 
-def extract_fields(text: str) -> dict:
+
+
+def _json_decimal(value):
+    if value in (None, "", "null"):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            return Decimal(str(value)).quantize(Decimal("0.01"))
+        except Exception:
+            return None
+    return _parse_decimal(str(value))
+
+
+def _json_date(value):
+    if not value:
+        return None
+    value = str(value).strip()
+    for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y"]:
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _openai_compatible_client():
+    """Erstellt einen OpenAI-kompatiblen Client.
+
+    Funktioniert mit OpenAI direkt und mit OpenRouter über:
+    - OPENAI_API_KEY
+    - OPENAI_BASE_URL=https://openrouter.ai/api/v1
+    """
+    from openai import OpenAI
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if not api_key:
+        return None
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url.rstrip("/")
+    return OpenAI(**kwargs)
+
+
+def _json_loads_lenient(raw: str) -> dict:
+    raw = (raw or "{}").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end >= start:
+        raw = raw[start:end + 1]
+    return json.loads(raw)
+
+
+def ai_document_extraction(text: str, file_path: str | None = None, content_type: str | None = None) -> Optional[dict]:
+    """Generische KI-Belegerkennung für Kassenbons und Rechnungen über OpenAI/OpenRouter."""
+    if not os.getenv("OPENAI_API_KEY"):
+        print("AI extraction skipped: OPENAI_API_KEY missing", flush=True)
+        return None
+    try:
+        client = _openai_compatible_client()
+        if client is None:
+            return None
+        model = os.getenv("OPENAI_EXTRACTION_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        print(f"AI extraction enabled: model={model}, base_url={base_url}", flush=True)
+
+        system = (
+            "Du bist ein deutscher Beleg- und Rechnungsextraktor für vorbereitende Buchhaltung. "
+            "Analysiere jeden Beleg generisch: Kassenbon, Tankbeleg, Restaurantbon, Online-Rechnung, PDF-Rechnung. "
+            "Priorität für Brutto/Gesamtsumme: SUMME, TOTAL, GESAMT, ZU ZAHLEN, BAR, KARTE, EC, VISA, MASTERCARD, KARTENZAHLUNG. "
+            "Verwechsele niemals MwSt.-Betrag, Netto, Liter, Menge, Literpreis, Uhrzeit, Terminalnummer, TSE-Nummer, Telefonnummer, PLZ oder Belegpositionsnummer mit Brutto. "
+            "Bei Steuertabellen mit MWST/UST/VAT + BRUTTO + NETTO: Brutto ist die Summe inkl. Steuer, MwSt ist nur der Steuerbetrag. "
+            "Rechnungsnummer nur setzen, wenn eindeutig 'Rechnung/Rechnungsnr/Invoice' erkennbar ist; bei normalen Kassenbons sonst null. "
+            "Gib ausschließlich valides JSON zurück. Keine Erklärungen."
+        )
+        schema = {
+            "vendor": "Händler/Lieferant, offizieller Name wenn erkennbar",
+            "invoice_date": "YYYY-MM-DD oder null",
+            "invoice_number": "echte Rechnungsnummer oder null",
+            "gross_amount": "Brutto/Gesamtsumme als Zahl, z.B. 75.57",
+            "vat_amount": "MwSt-Betrag als Zahl oder null",
+            "vat_rate": "MwSt-Satz als Zahl, z.B. 19 oder 7 oder null",
+            "payment_method": "Bar, Bank, Kreditkarte/Bank, EC-Karte, PayPal oder Unbekannt",
+            "currency": "EUR",
+            "extraction_confidence": "0 bis 1"
+        }
+        user_text = (
+            "Extrahiere die Felder aus dem Beleg. Antworte exakt im JSON-Schema:\n"
+            f"{json.dumps(schema, ensure_ascii=False)}\n\n"
+            "OCR-Text:\n"
+            f"{text[:10000]}"
+        )
+        text_content = [{"type": "text", "text": user_text}]
+        content = list(text_content)
+
+        suffix = Path(file_path).suffix.lower() if file_path else ""
+        if file_path and suffix in [".jpg", ".jpeg", ".png", ".webp"]:
+            mime = "image/webp" if suffix == ".webp" else ("image/png" if suffix == ".png" else "image/jpeg")
+            raw_img = Path(file_path).read_bytes()
+            b64 = base64.b64encode(raw_img).decode("ascii")
+            content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}})
+
+        def call_ai(msg_content):
+            try:
+                return client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": msg_content}],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as e:
+                print(f"AI extraction JSON-mode failed, retrying without response_format: {e}", flush=True)
+                return client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": msg_content}],
+                    temperature=0,
+                )
+
+        try:
+            res = call_ai(content)
+        except Exception as e:
+            # Einige OpenRouter-Textmodelle unterstützen keine Bildinputs. Dann OCR-Text-only versuchen.
+            print(f"AI extraction with image failed, retrying text-only: {e}", flush=True)
+            res = call_ai(text_content)
+
+        raw = res.choices[0].message.content or "{}"
+        data = _json_loads_lenient(raw)
+
+        out = {
+            "vendor": data.get("vendor"),
+            "invoice_date": _json_date(data.get("invoice_date")),
+            "invoice_number": data.get("invoice_number") or None,
+            "gross_amount": _json_decimal(data.get("gross_amount")),
+            "vat_amount": _json_decimal(data.get("vat_amount")),
+            "vat_rate": _json_decimal(data.get("vat_rate")),
+            "currency": data.get("currency") or "EUR",
+        }
+        payment = data.get("payment_method")
+        if payment:
+            out["payment_method"] = str(payment)
+        print("AI extraction success", flush=True)
+        return out
+    except Exception as e:
+        print(f"AI extraction failed: {e}", flush=True)
+        return None
+
+
+def _merge_ai_fields(local: dict, ai: Optional[dict]) -> dict:
+    if not ai:
+        return local
+    merged = dict(local)
+    # KI darf diese Extraktionsfelder überschreiben, weil sie generisch Layouts versteht.
+    for key in ["vendor", "invoice_date", "invoice_number", "gross_amount", "vat_amount", "vat_rate", "currency"]:
+        val = ai.get(key)
+        if val not in (None, ""):
+            merged[key] = val
+    # Zahlungsart nur übernehmen, wenn erkannt.
+    if ai.get("payment_method") and ai.get("payment_method") != "Unbekannt":
+        merged["payment_method"] = ai.get("payment_method")
+        if "bar" in str(ai.get("payment_method")).lower():
+            merged["contra_account"] = "1000"
+        elif any(k in str(ai.get("payment_method")).lower() for k in ["karte", "bank", "paypal"]):
+            merged["contra_account"] = "1200"
+    return merged
+
+def extract_fields(text: str, file_path: str | None = None, content_type: str | None = None) -> dict:
     text = _normalize_ocr_text(text)
     gross = find_receipt_total(text)
     if gross is None:
@@ -479,7 +679,7 @@ def extract_fields(text: str) -> dict:
     vendor = find_vendor(text)
     booking = suggest_booking(text, vendor, vat_rate)
 
-    return {
+    local_fields = {
         "invoice_date": find_date(text),
         "vendor": vendor,
         "invoice_number": find_invoice_number(text),
@@ -489,3 +689,16 @@ def extract_fields(text: str) -> dict:
         **booking,
         "currency": "EUR" if "€" in text or "EUR" in text.upper() or "EÜR" in text.upper() else None,
     }
+
+    ai_fields = ai_document_extraction(text, file_path=file_path, content_type=content_type)
+    merged = _merge_ai_fields(local_fields, ai_fields)
+
+    # Nach AI-Extraktion Kontierung nochmals anhand besserer Händler-/Steuerdaten berechnen.
+    booking = suggest_booking(text, merged.get("vendor"), merged.get("vat_rate"))
+    for key, value in booking.items():
+        merged.setdefault(key, value)
+    # Wenn KI Zahlungsart erkannt hat, nicht überschreiben.
+    if ai_fields and ai_fields.get("payment_method") and ai_fields.get("payment_method") != "Unbekannt":
+        merged["payment_method"] = ai_fields.get("payment_method")
+        merged["contra_account"] = "1000" if "bar" in str(ai_fields.get("payment_method")).lower() else "1200"
+    return merged

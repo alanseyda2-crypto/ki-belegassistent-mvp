@@ -131,7 +131,7 @@ def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db))
         shutil.copyfileobj(file.file, buffer)
 
     ocr_text = extract_text(str(target), file.content_type or "")
-    fields = extract_fields(ocr_text)
+    fields = extract_fields(ocr_text, str(target), file.content_type or "")
 
     ai_booking = ai_skr03_suggestion(
         ocr_text,

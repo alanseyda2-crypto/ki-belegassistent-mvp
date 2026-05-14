@@ -80,16 +80,48 @@ def rule_based_skr03(text: str, vendor: Optional[str], vat_rate: Optional[Decima
     }
 
 
+def _openai_compatible_client():
+    from openai import OpenAI
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if not api_key:
+        return None
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url.rstrip("/")
+    return OpenAI(**kwargs)
+
+
+def _json_loads_lenient(raw: str) -> dict:
+    raw = (raw or "{}").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end >= start:
+        raw = raw[start:end + 1]
+    return json.loads(raw)
+
+
 def ai_skr03_suggestion(text: str, vendor: Optional[str], invoice_date, gross_amount, vat_amount, vat_rate) -> Optional[dict]:
-    """Optional: nutzt OpenAI nur, wenn OPENAI_API_KEY gesetzt ist. Sonst None."""
+    """SKR03-Kontierung über OpenAI-kompatible API, z.B. OpenRouter."""
     if not os.getenv("OPENAI_API_KEY"):
+        print("AI SKR03 skipped: OPENAI_API_KEY missing", flush=True)
         return None
     try:
-        from openai import OpenAI
-        client = OpenAI()
+        client = _openai_compatible_client()
+        if client is None:
+            return None
+        model = os.getenv("OPENAI_ACCOUNTING_MODEL", os.getenv("OPENAI_EXTRACTION_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")))
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        print(f"AI SKR03 enabled: model={model}, base_url={base_url}", flush=True)
         prompt = f"""
-Du bist ein deutscher Buchhaltungsassistent. Erstelle einen Kontierungsvorschlag nach SKR03.
-Wichtig: Keine Steuerberatung, nur Vorschlag. Gib ausschließlich valides JSON zurück.
+Du bist ein deutscher Buchhaltungsassistent. Erstelle einen plausiblen Kontierungsvorschlag nach SKR03.
+Es ist nur ein Vorschlag für vorbereitende Buchhaltung, keine Steuerberatung.
+Gib ausschließlich valides JSON zurück.
 
 Beleg:
 Lieferant: {vendor}
@@ -98,25 +130,41 @@ Brutto: {gross_amount}
 MwSt-Betrag: {vat_amount}
 MwSt-Satz: {vat_rate}%
 OCR-Text:
-{text[:6000]}
+{text[:8000]}
 
-JSON-Felder:
-booking_category, account, contra_account, payment_method, vat_key, booking_text, booking_confidence
-booking_confidence als Zahl zwischen 0 und 1.
+JSON-Felder exakt:
+{{
+  "booking_category": "Kategorie",
+  "account": "SKR03-Aufwandskonto, z.B. 4530, 4920, 4930, 4980",
+  "contra_account": "Zahlungskonto, meist 1200 Bank oder 1000 Kasse",
+  "payment_method": "Bar, Bank, Kreditkarte/Bank, EC-Karte, PayPal oder Unbekannt",
+  "vat_key": "z.B. 19% Vorsteuer, 7% Vorsteuer, Vorsteuer prüfen",
+  "booking_text": "kurzer Buchungstext",
+  "booking_confidence": 0.0
+}}
 """
-        res = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-        )
-        raw = res.choices[0].message.content.strip().strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:].strip()
-        data = json.loads(raw)
+        try:
+            res = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+        except Exception as e:
+            print(f"AI SKR03 JSON-mode failed, retrying without response_format: {e}", flush=True)
+            res = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+        raw = res.choices[0].message.content
+        data = _json_loads_lenient(raw)
         required = ["booking_category", "account", "contra_account", "payment_method", "vat_key", "booking_text", "booking_confidence"]
         if all(k in data for k in required):
             data["booking_confidence"] = Decimal(str(data.get("booking_confidence", 0.75))).quantize(Decimal("0.01"))
+            print("AI SKR03 success", flush=True)
             return data
-    except Exception:
+    except Exception as e:
+        print(f"AI SKR03 failed: {e}", flush=True)
         return None
     return None
