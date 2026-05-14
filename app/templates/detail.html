@@ -7,7 +7,10 @@
       <p class="eyebrow">Belegdetails</p>
       <h1>{{ doc.original_filename }}</h1>
     </div>
-    <a class="link-button" href="/documents/{{ doc.id }}/file">Original öffnen</a>
+    <div class="actions compact">
+      <a class="link-button" href="/documents/{{ doc.id }}/file" target="_blank">Rechnung öffnen</a>
+      <a class="link-button" href="/documents/{{ doc.id }}/download">Herunterladen</a>
+    </div>
   </div>
 
   <div class="grid">
@@ -20,28 +23,7 @@
     <div><strong>Status</strong><span>{% if doc.is_confirmed %}bestätigt{% else %}{{ doc.status }}{% endif %}</span></div>
   </div>
 
-  <h2>SKR03-Kontierungsvorschlag</h2>
-  <div class="grid">
-    <div><strong>Kategorie</strong><span>{{ doc.booking_category or '—' }}</span></div>
-    <div><strong>Konto</strong><span>{{ doc.account or '—' }}</span></div>
-    <div><strong>Gegenkonto</strong><span>{{ doc.contra_account or '—' }}</span></div>
-    <div><strong>Zahlungsart</strong><span>{{ doc.payment_method or '—' }}</span></div>
-    <div><strong>Steuerschlüssel</strong><span>{{ doc.vat_key or '—' }}</span></div>
-    <div><strong>Quelle</strong><span>{{ doc.booking_source or '—' }}</span></div>
-    <div><strong>Sicherheit</strong><span>{% if doc.booking_confidence %}{{ '%.0f'|format(doc.booking_confidence * 100) }}%{% else %}—{% endif %}</span></div>
-    <div><strong>Buchungstext</strong><span>{{ doc.booking_text or '—' }}</span></div>
-  </div>
-
-  <div class="actions">
-    <form action="/documents/{{ doc.id }}/ai-booking" method="post">
-      <button type="submit">AI/SKR03 Vorschlag neu berechnen</button>
-    </form>
-    <form action="/documents/{{ doc.id }}/confirm" method="post">
-      <button type="submit">Vorschlag bestätigen & lernen</button>
-    </form>
-  </div>
-
-  <h2>Kontierung korrigieren</h2>
+  <h2>SKR03-Kontierung</h2>
   <form class="edit-form" action="/documents/{{ doc.id }}/correct" method="post">
     <label>Kategorie <input name="booking_category" value="{{ doc.booking_category or '' }}"></label>
     <label>Konto <input name="account" value="{{ doc.account or '' }}" required></label>
@@ -49,14 +31,21 @@
     <label>Zahlungsart <input name="payment_method" value="{{ doc.payment_method or 'Bank' }}"></label>
     <label>Steuerschlüssel <input name="vat_key" value="{{ doc.vat_key or '' }}"></label>
     <label>Buchungstext <input name="booking_text" value="{{ doc.booking_text or '' }}"></label>
-    <label class="checkbox"><input type="checkbox" name="save_rule" value="1" checked> Für diesen Lieferanten als Lernregel speichern</label>
-    <button type="submit">Korrektur speichern</button>
+    <label>Sicherheit <input value="{% if doc.booking_confidence %}{{ '%.0f'|format(doc.booking_confidence * 100) }}%{% else %}—{% endif %}" disabled></label>
+    <label class="checkbox"><input type="checkbox" name="save_rule" value="1" checked> Für diesen Lieferanten merken</label>
+    <button type="submit">Kontierung speichern</button>
   </form>
 
-  <p class="hint">Hinweis: Das ist ein Kontierungsvorschlag für vorbereitende Buchhaltung, keine Steuerberatung. Vor DATEV-Import immer prüfen.</p>
+  <div class="actions">
+    <form action="/documents/{{ doc.id }}/ai-booking" method="post">
+      <button type="submit">Vorschlag neu berechnen</button>
+    </form>
+    <form action="/documents/{{ doc.id }}/confirm" method="post">
+      <button type="submit">Bestätigen & lernen</button>
+    </form>
+  </div>
 
-  <h2>Erkannter Text</h2>
-  <pre>{{ doc.ocr_text or 'Kein Text erkannt.' }}</pre>
+  <p class="hint">DATEV-Export bitte erst nach Prüfung/Bestätigung nutzen. Die Kontierung ist ein Vorschlag für vorbereitende Buchhaltung.</p>
 
   <form action="/documents/{{ doc.id }}/delete" method="post" onsubmit="return confirm('Beleg wirklich löschen?')">
     <button class="danger" type="submit">Beleg löschen</button>

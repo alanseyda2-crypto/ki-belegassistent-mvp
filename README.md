@@ -1,55 +1,31 @@
-# KI-Belegassistent MVP — Railway Ready
+# KI-Belegassistent MVP
 
-Ein erster MVP für einen KI-Assistenten für vorbereitende Buchhaltung.
-
-## Funktionen
+Railway-ready MVP für vorbereitende Buchhaltung:
 
 - Upload von PDF/JPG/PNG/WEBP
-- Speichern der Belege
-- Texterkennung bei PDFs
-- Bild-OCR über Tesseract
-- automatische Extraktion von Datum, Lieferant, Betrag, MwSt. und Rechnungsnummer
-- Sortierung nach Rechnungsdatum
-- Dashboard und Detailansicht
+- Belegdaten-Erkennung: Datum, Lieferant, Rechnungsnummer, Brutto, MwSt.-Betrag, MwSt.-Satz
+- SKR03-Kontierungsvorschläge
+- manuelle Korrektur und Lernregeln
+- Originalrechnung öffnen und herunterladen
+- DATEV-CSV Export für alle oder nur bestätigte Belege
 
 ## Lokal starten
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Dann öffnen:
-
-```text
-http://127.0.0.1:8000
-```
-
-## Railway Deployment
-
-Dieses Projekt ist bereits Railway-ready.
-
-Wichtige Dateien:
-
-- `Dockerfile`
-- `railway.json`
-- `start.sh`
-- `Procfile`
-- `requirements.txt`
-
-Railway Start Command:
+## Railway Start Command
 
 ```bash
-sh start.sh
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
-Falls Railway fragt: Builder = Dockerfile.
+Optional für AI-Kontierung:
 
-## Hinweis
+```text
+OPENAI_API_KEY=dein_key
+```
 
-SQLite und lokale Uploads sind für den MVP okay. Für Produktion später ersetzen durch:
-
-- PostgreSQL
-- S3/Supabase Storage
-- Azure Document Intelligence
-- OpenAI Kontierungsvorschläge
+Hinweis: Der DATEV-CSV-Export ist eine Import-Vorbereitung/Buchungsstapel-Struktur. Je nach DATEV-Setup beim Steuerberater können zusätzliche Stapel-Metadaten erforderlich sein.

@@ -88,3 +88,5 @@ pre { white-space: pre-wrap; background: #17151f; color: #f5f0ff; padding: 18px;
   font-size: 0.95rem;
 }
 .actions{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}.edit-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:12px 0 24px}.edit-form label{font-weight:700;color:#6f687f}.edit-form input{width:100%;margin-top:7px;padding:13px 14px;border:1px solid #ded7ef;border-radius:14px;font:inherit;background:#fff}.edit-form .checkbox{grid-column:1/-1;display:flex;align-items:center;gap:10px}.edit-form .checkbox input{width:auto;margin:0}.hint strong{color:#5c35cf}
+.actions.compact{margin:0}.small{padding:9px 12px;border-radius:10px;font-size:12px}.rule-row{display:grid;grid-template-columns:1.4fr 1fr .6fr .8fr .9fr .4fr auto;gap:8px;align-items:center}.rule-row input{width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;background:#fff}.rule-row span{font-weight:800;color:var(--muted)}
+@media(max-width:900px){.rule-row{grid-template-columns:1fr}.rule-row span:before{content:'Genutzt: ';}}

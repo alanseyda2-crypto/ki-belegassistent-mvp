@@ -5,9 +5,23 @@
   <div class="section-header">
     <div>
       <p class="eyebrow">Lernfunktion</p>
-      <h1>Gespeicherte Kontierungsregeln</h1>
+      <h1>Kontierungsregeln</h1>
     </div>
   </div>
+
+  <h2>Neue Regel anlegen</h2>
+  <form class="edit-form" action="/rules/create" method="post">
+    <label>Lieferant <input name="vendor" placeholder="z. B. Adobe" required></label>
+    <label>Kategorie <input name="category" placeholder="Software/Lizenzen"></label>
+    <label>Konto <input name="account" placeholder="4964" required></label>
+    <label>Gegenkonto <input name="contra_account" value="1200" required></label>
+    <label>Zahlungsart <input name="payment_method" value="Bank"></label>
+    <label>Steuerschlüssel <input name="vat_key" placeholder="19% Vorsteuer"></label>
+    <label>Buchungstext <input name="booking_text" placeholder="Software- und Lizenzkosten"></label>
+    <button type="submit">Regel speichern</button>
+  </form>
+
+  <h2>Gespeicherte Regeln</h2>
   <div class="table-wrap">
     <table>
       <thead>
@@ -18,20 +32,31 @@
           <th>Gegenkonto</th>
           <th>Steuer</th>
           <th>Genutzt</th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
         {% for rule in rules %}
         <tr>
-          <td>{{ rule.vendor }}</td>
-          <td>{{ rule.category or '—' }}</td>
-          <td>{{ rule.account }}</td>
-          <td>{{ rule.contra_account }}</td>
-          <td>{{ rule.vat_key or '—' }}</td>
-          <td>{{ rule.times_used }}</td>
+          <td colspan="7">
+            <form class="rule-row" action="/rules/{{ rule.id }}/update" method="post">
+              <input name="vendor" value="{{ rule.vendor }}" required>
+              <input name="category" value="{{ rule.category or '' }}">
+              <input name="account" value="{{ rule.account }}" required>
+              <input name="contra_account" value="{{ rule.contra_account }}" required>
+              <input name="vat_key" value="{{ rule.vat_key or '' }}">
+              <span>{{ rule.times_used }}</span>
+              <button type="submit">Speichern</button>
+              <input type="hidden" name="payment_method" value="{{ rule.payment_method or 'Bank' }}">
+              <input type="hidden" name="booking_text" value="{{ rule.booking_text or '' }}">
+            </form>
+            <form action="/rules/{{ rule.id }}/delete" method="post" onsubmit="return confirm('Lernregel löschen?')">
+              <button class="danger small" type="submit">Löschen</button>
+            </form>
+          </td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="empty">Noch keine Lernregeln gespeichert.</td></tr>
+        <tr><td colspan="7" class="empty">Noch keine Lernregeln gespeichert.</td></tr>
         {% endfor %}
       </tbody>
     </table>

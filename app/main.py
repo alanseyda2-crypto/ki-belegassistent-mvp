@@ -36,7 +36,6 @@ def ensure_columns():
         ("vat_key", "VARCHAR(100)"),
         ("booking_text", "VARCHAR(255)"),
         ("booking_confidence", "NUMERIC(4,2)"),
-        ("booking_source", "VARCHAR(50) DEFAULT 'regelwerk'"),
         ("is_confirmed", "BOOLEAN DEFAULT 0"),
     ]
     with engine.begin() as conn:
@@ -75,7 +74,6 @@ def apply_learned_rule(db: Session, doc: Document, fields: dict) -> dict:
         "vat_key": rule.vat_key,
         "booking_text": rule.booking_text,
         "booking_confidence": Decimal("0.96"),
-        "booking_source": "lernregel",
     })
     return fields
 
@@ -168,7 +166,6 @@ def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db))
         vat_key=fields.get("vat_key"),
         booking_text=fields.get("booking_text"),
         booking_confidence=fields.get("booking_confidence"),
-        booking_source=fields.get("booking_source") or "regelwerk",
         currency=fields.get("currency") or "EUR",
         ocr_text=ocr_text,
     )
@@ -221,7 +218,6 @@ def correct_booking(
     doc.vat_key = vat_key
     doc.booking_text = booking_text
     doc.booking_confidence = Decimal("1.00")
-    doc.booking_source = "manuell"
     doc.is_confirmed = True
     if save_rule:
         create_or_update_rule(db, doc)
@@ -245,7 +241,20 @@ def document_file(document_id: int, db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Beleg nicht gefunden")
-    return FileResponse(doc.file_path, filename=doc.original_filename)
+    return FileResponse(doc.file_path, filename=doc.original_filename, media_type=doc.file_type)
+
+
+@app.get("/documents/{document_id}/download")
+def document_download(document_id: int, db: Session = Depends(get_db)):
+    doc = db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Beleg nicht gefunden")
+    return FileResponse(
+        doc.file_path,
+        filename=doc.original_filename,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={doc.original_filename}"},
+    )
 
 
 @app.post("/documents/{document_id}/delete")
@@ -262,39 +271,77 @@ def delete_document(document_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/export/datev")
-def export_datev(db: Session = Depends(get_db)):
-    docs = db.query(Document).order_by(Document.invoice_date.asc()).all()
+def export_datev(db: Session = Depends(get_db), confirmed_only: bool = False):
+    query = db.query(Document)
+    if confirmed_only:
+        query = query.filter(Document.is_confirmed == True)
+    docs = query.order_by(Document.invoice_date.asc(), Document.id.asc()).all()
+
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
+
+    # Kompakter Buchungsstapel-Export für die Weiterverarbeitung/Import-Vorbereitung.
+    # DATEV-Programme erwarten je nach Version/Berater-Setup ggf. zusätzliche Stapel-Metadaten.
     writer.writerow([
-        "Umsatz", "Soll/Haben", "WKZ Umsatz", "Kurs", "Basis-Umsatz", "WKZ Basis-Umsatz",
-        "Konto", "Gegenkonto", "BU-Schlüssel", "Belegdatum", "Belegfeld 1", "Buchungstext",
-        "Lieferant", "Kategorie", "MwSt %", "MwSt Betrag", "Quelle", "Bestätigt"
+        "Umsatz",
+        "Soll/Haben-Kennzeichen",
+        "WKZ Umsatz",
+        "Konto",
+        "Gegenkonto",
+        "BU-Schlüssel",
+        "Belegdatum",
+        "Belegfeld 1",
+        "Buchungstext",
+        "Lieferant",
+        "Kategorie",
+        "Zahlungsart",
+        "MwSt-Satz",
+        "MwSt-Betrag",
+        "Bestätigt",
+        "Dateiname",
     ])
+
     for d in docs:
-        bu = "9" if str(d.vat_key or "").startswith("19") else "8" if str(d.vat_key or "").startswith("7") else ""
+        vat_rate = float(d.vat_rate or 0)
+        if vat_rate == 19:
+            bu = "9"
+        elif vat_rate == 7:
+            bu = "8"
+        elif vat_rate == 0:
+            bu = ""
+        else:
+            bu = ""
+
+        amount = f"{float(d.gross_amount or 0):.2f}".replace(".", ",")
+        vat_amount = f"{float(d.vat_amount or 0):.2f}".replace(".", ",") if d.vat_amount is not None else ""
+        vat_rate_text = f"{vat_rate:.2f}".replace(".", ",") if d.vat_rate is not None else ""
+        belegdatum = d.invoice_date.strftime("%d%m") if d.invoice_date else ""
+        text_value = d.booking_text or d.vendor or d.original_filename or "Beleg"
+
         writer.writerow([
-            f"{float(d.gross_amount or 0):.2f}".replace(".", ","),
+            amount,
             "S",
             d.currency or "EUR",
-            "", "", "",
             d.account or "",
             d.contra_account or "",
             bu,
-            d.invoice_date.strftime("%d%m") if d.invoice_date else "",
+            belegdatum,
             d.invoice_number or "",
-            d.booking_text or "",
+            text_value[:60],
             d.vendor or "",
             d.booking_category or "",
-            f"{float(d.vat_rate or 0):.2f}".replace(".", ",") if d.vat_rate else "",
-            f"{float(d.vat_amount or 0):.2f}".replace(".", ",") if d.vat_amount else "",
-            d.booking_source or "",
+            d.payment_method or "",
+            vat_rate_text,
+            vat_amount,
             "ja" if d.is_confirmed else "nein",
+            d.original_filename or d.filename,
         ])
+
     output.seek(0)
-    filename = f"datev_export_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
+    suffix = "bestaetigt" if confirmed_only else "alle"
+    filename = f"datev_buchungsstapel_{suffix}_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
     return StreamingResponse(
-        iter([output.getvalue()]),
+        iter(["\ufeff" + output.getvalue()]),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
@@ -304,3 +351,64 @@ def export_datev(db: Session = Depends(get_db)):
 def rules(request: Request, db: Session = Depends(get_db)):
     rules = db.query(BookingRule).order_by(desc(BookingRule.times_used), BookingRule.vendor.asc()).all()
     return templates.TemplateResponse("rules.html", {"request": request, "rules": rules})
+
+
+@app.post("/rules/create")
+def create_rule(
+    vendor: str = Form(...),
+    category: str = Form(""),
+    account: str = Form(...),
+    contra_account: str = Form("1200"),
+    payment_method: str = Form("Bank"),
+    vat_key: str = Form(""),
+    booking_text: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    rule = BookingRule(
+        vendor=vendor.strip(),
+        category=category.strip() or None,
+        account=account.strip(),
+        contra_account=contra_account.strip(),
+        payment_method=payment_method.strip() or None,
+        vat_key=vat_key.strip() or None,
+        booking_text=booking_text.strip() or None,
+    )
+    db.add(rule)
+    db.commit()
+    return RedirectResponse(url="/rules", status_code=303)
+
+
+@app.post("/rules/{rule_id}/update")
+def update_rule(
+    rule_id: int,
+    vendor: str = Form(...),
+    category: str = Form(""),
+    account: str = Form(...),
+    contra_account: str = Form("1200"),
+    payment_method: str = Form("Bank"),
+    vat_key: str = Form(""),
+    booking_text: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    rule = db.get(BookingRule, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="Lernregel nicht gefunden")
+    rule.vendor = vendor.strip()
+    rule.category = category.strip() or None
+    rule.account = account.strip()
+    rule.contra_account = contra_account.strip()
+    rule.payment_method = payment_method.strip() or None
+    rule.vat_key = vat_key.strip() or None
+    rule.booking_text = booking_text.strip() or None
+    rule.updated_at = datetime.utcnow()
+    db.commit()
+    return RedirectResponse(url="/rules", status_code=303)
+
+
+@app.post("/rules/{rule_id}/delete")
+def delete_rule(rule_id: int, db: Session = Depends(get_db)):
+    rule = db.get(BookingRule, rule_id)
+    if rule:
+        db.delete(rule)
+        db.commit()
+    return RedirectResponse(url="/rules", status_code=303)

@@ -77,7 +77,6 @@ def rule_based_skr03(text: str, vendor: Optional[str], vat_rate: Optional[Decima
         "vat_key": vat_key_from_rate(vat_rate),
         "booking_text": booking_text,
         "booking_confidence": confidence,
-        "booking_source": "regelwerk",
     }
 
 
@@ -116,7 +115,6 @@ booking_confidence als Zahl zwischen 0 und 1.
         data = json.loads(raw)
         required = ["booking_category", "account", "contra_account", "payment_method", "vat_key", "booking_text", "booking_confidence"]
         if all(k in data for k in required):
-            data["booking_source"] = "openai"
             data["booking_confidence"] = Decimal(str(data.get("booking_confidence", 0.75))).quantize(Decimal("0.01"))
             return data
     except Exception:
