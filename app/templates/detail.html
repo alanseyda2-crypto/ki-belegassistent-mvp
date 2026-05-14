@@ -7,10 +7,7 @@
       <p class="eyebrow">Belegdetails</p>
       <h1>{{ doc.original_filename }}</h1>
     </div>
-    <div class="actions compact">
-      <a class="link-button" href="/documents/{{ doc.id }}/file" target="_blank">Rechnung öffnen</a>
-      <a class="link-button" href="/documents/{{ doc.id }}/download">Herunterladen</a>
-    </div>
+
   </div>
 
   <div class="grid">
@@ -47,8 +44,11 @@
 
   <p class="hint">DATEV-Export bitte erst nach Prüfung/Bestätigung nutzen. Die Kontierung ist ein Vorschlag für vorbereitende Buchhaltung.</p>
 
-  <form action="/documents/{{ doc.id }}/delete" method="post" onsubmit="return confirm('Beleg wirklich löschen?')">
-    <button class="danger" type="submit">Beleg löschen</button>
-  </form>
+  <div class="actions">
+    <a class="link-button" href="/documents/{{ doc.id }}/download">Beleg herunterladen</a>
+    <form action="/documents/{{ doc.id }}/delete" method="post" onsubmit="return confirm('Beleg wirklich löschen?')">
+      <button class="danger" type="submit">Beleg löschen</button>
+    </form>
+  </div>
 </section>
 {% endblock %}
