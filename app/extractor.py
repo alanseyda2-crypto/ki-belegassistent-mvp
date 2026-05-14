@@ -189,6 +189,107 @@ def _amounts_in_line(line: str) -> list[Decimal]:
     return vals
 
 
+def _normalize_ocr_text(text: str) -> str:
+    """Korrigiert typische OCR-Fehler auf Kassenbons, ohne Originaldatei zu ändern."""
+    replacements = {
+        "MIST": "MWST",
+        "MWSI": "MWST",
+        "MW5T": "MWST",
+        "UST.": "UST",
+        "€UR": "EUR",
+        "EÜR": "EUR",
+        "SROS5O": "BRUTTO",
+    }
+    out = text
+    for wrong, right in replacements.items():
+        out = re.sub(re.escape(wrong), right, out, flags=re.IGNORECASE)
+    return out
+
+
+def _clean_vendor_line(line: str) -> str:
+    line = re.sub(r"[^A-Za-zÄÖÜäöüß0-9& .,'/-]", "", line)
+    return re.sub(r"\s+", " ", line).strip(" ,;:-")
+
+
+def _is_likely_money_amount(value: Decimal) -> bool:
+    """Filtert typische OCR-Störwerte wie MwSt.-Sätze, Literpreise und Nullwerte."""
+    return Decimal("0.01") <= value < Decimal("100000.00")
+
+
+def _line_context(lines: list[str], index: int, before: int = 1, after: int = 2) -> str:
+    start = max(0, index - before)
+    end = min(len(lines), index + after + 1)
+    return " ".join(lines[start:end])
+
+
+def find_receipt_total(text: str) -> Optional[Decimal]:
+    """Robuste Speziallogik für Handyfotos, Kassenbons und Tankbelege.
+
+    Priorität: explizite Brutto-/Total-/Kartenzahlung-Zeilen. Liter, Literpreise,
+    MwSt-Sätze, Netto-Beträge und einzelne Steuersätze werden konsequent ignoriert.
+    """
+    text = _normalize_ocr_text(text)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    candidates: list[tuple[int, Decimal]] = []
+
+    strong_total = ["total", "gesamtsumme", "gesamtbetrag", "gesamtpreis", "summe", "zu zahlen", "brutto"]
+    payment_words = ["kartenzahlung", "mastercard", "visa", "girocard", "ec-karte", "debit", "kreditkarte", "karte"]
+    ignore_words = ["liter", "eur/l", "eur / l", "l/", "stk", "menge", "einzelpreis", "netto"]
+
+    # 1) Wenn eine Zeile BRUTTO enthält, Wert direkt nach BRUTTO bevorzugen.
+    for line in lines:
+        lower = line.lower()
+        m = re.search(r"brutto[^0-9]{0,25}" + _amount_regex(), line, re.IGNORECASE)
+        if m:
+            val = _parse_decimal(m.group(1))
+            if val and _is_likely_money_amount(val) and val not in [Decimal("7.00"), Decimal("19.00")]:
+                candidates.append((260 + min(int(val), 80), val))
+
+    # 2) Explizite Total-/Gesamt-/Zahlungszeilen. Bei mehreren Zahlen meist letzte/groesste Zahl.
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        has_total = any(k in lower for k in strong_total)
+        has_payment = any(k in lower for k in payment_words)
+        has_betrag = bool(re.search(r"\bbetrag\b", lower))
+        if not (has_total or has_payment or has_betrag):
+            continue
+        # Nächste Zeile mitnehmen, weil OCR Betrag manchmal in Folgezeile setzt.
+        window = _line_context(lines, i, before=0, after=1)
+        vals = _amounts_in_line(window)
+        for val in vals:
+            if not _is_likely_money_amount(val) or val in [Decimal("7.00"), Decimal("19.00")]:
+                continue
+            score = 0
+            if has_total:
+                score += 210
+            if "brutto" in lower:
+                score += 230
+            if has_payment:
+                score += 170
+            if has_betrag:
+                score += 120
+            if any(w in lower for w in ignore_words):
+                score -= 180
+            if "mwst" in lower or "ust" in lower or "steuer" in lower:
+                score -= 130
+            if "netto" in lower and "brutto" not in lower:
+                score -= 160
+            # Höhere Bruttowerte innerhalb derselben Zeile leicht bevorzugen.
+            score += min(int(val), 80)
+            candidates.append((score, val))
+
+    # 3) Muster: NETTO x MWST y BRUTTO z oder NETTO x BRUTTO z.
+    brutto_matches = re.finditer(r"brutto[^0-9]{0,25}" + _amount_regex(), text, re.IGNORECASE)
+    for m in brutto_matches:
+        val = _parse_decimal(m.group(1))
+        if val and _is_likely_money_amount(val) and val not in [Decimal("7.00"), Decimal("19.00")]:
+            candidates.append((240 + min(int(val), 80), val))
+
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return candidates[0][1]
+    return None
+
 def find_amount(text: str, labels: list[str]) -> Optional[Decimal]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     # stärkste Logik: auf Zeilen mit TOTAL/Gesamt/Summe bevorzugt letzte/groesste Geldzahl nehmen
@@ -213,18 +314,36 @@ def find_amount(text: str, labels: list[str]) -> Optional[Decimal]:
 
 
 def find_vat(text: str) -> Optional[Decimal]:
+    text = _normalize_ocr_text(text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # Direktmuster auf MwSt-Zeilen: "MWST 19,00% A 12,07 EUR".
     for i, line in enumerate(lines):
         lower = line.lower()
-        if any(k in lower for k in ["mwst", "ust", "umsatzsteuer", "vat", "tax"]):
-            window = " ".join(lines[i:i+2])
-            vals = _amounts_in_line(window)
-            # Beim MwSt.-Satz steht oft 19,00 vor dem Steuerbetrag; Steuerbetrag ist meist letzte Geldzahl
-            money_vals = [v for v in vals if v < Decimal("1000.00")]
-            if money_vals:
-                # Beträge wie 19.00 als Prozentsatz ignorieren, falls weitere Werte vorhanden sind
-                filtered = [v for v in money_vals if v not in [Decimal("7.00"), Decimal("19.00")]]
-                return filtered[-1] if filtered else money_vals[-1]
+        if not any(k in lower for k in ["mwst", "ust", "umsatzsteuer", "vat", "tax"]):
+            continue
+        if "netto" in lower and "brutto" in lower and "mwst" not in lower:
+            continue
+        window = _line_context(lines, i, before=0, after=0)
+        vals = _amounts_in_line(window)
+        vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
+        if vals:
+            # Steuerbetrag ist auf MwSt-Zeilen meist der letzte Geldwert.
+            return vals[-1]
+
+    # Wenn Steuerbetrag in der Folgezeile steht, maximal eine Zeile weiter suchen.
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if not any(k in lower for k in ["mwst", "ust", "umsatzsteuer", "vat", "tax"]):
+            continue
+        window = _line_context(lines, i, before=0, after=1)
+        # Nicht die Netto-/Brutto-Zeile als Steuerbetrag nehmen.
+        window = " ".join([part for part in window.split("  ") if "netto" not in part.lower() and "brutto" not in part.lower()])
+        vals = _amounts_in_line(window)
+        vals = [v for v in vals if _is_likely_money_amount(v) and v not in [Decimal("7.00"), Decimal("19.00")]]
+        if vals:
+            return vals[-1]
+
     patterns = [
         rf"(?:MwSt\.?|USt\.?|Umsatzsteuer|VAT|Tax)[^\n]{{0,80}}{_amount_regex()}",
         rf"(?:7\s*%|19\s*%)[^\n]{{0,50}}{_amount_regex()}",
@@ -232,9 +351,10 @@ def find_vat(text: str) -> Optional[Decimal]:
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return _parse_decimal(match.group(1))
+            val = _parse_decimal(match.group(1))
+            if val and val not in [Decimal("7.00"), Decimal("19.00")]:
+                return val
     return None
-
 
 def find_vat_rate(text: str) -> Optional[Decimal]:
     patterns = [
@@ -254,40 +374,76 @@ def find_vat_rate(text: str) -> Optional[Decimal]:
 
 
 def find_largest_amount(text: str) -> Optional[Decimal]:
-    values = re.findall(_amount_regex(), text, flags=re.IGNORECASE)
-    decimals = [_parse_decimal(v) for v in values]
-    decimals = [d for d in decimals if d is not None]
-    # unrealistisch große Transaktions-/Kartennummern fallen durch Regex meist nicht rein, trotzdem filtern
-    decimals = [d for d in decimals if d < Decimal("100000.00")]
-    return max(decimals) if decimals else None
-
+    text = _normalize_ocr_text(text)
+    vals: list[Decimal] = []
+    for line in text.splitlines():
+        lower = line.lower()
+        if any(k in lower for k in ["liter", "eur/l", "eur / l", "stk", "menge", "einzelpreis", "art.-nr", "terminal", "transaktion"]):
+            continue
+        for v in _amounts_in_line(line):
+            if v is None or not _is_likely_money_amount(v):
+                continue
+            if v in [Decimal("7.00"), Decimal("19.00")]:
+                continue
+            vals.append(v)
+    return max(vals) if vals else None
 
 def find_vendor(text: str) -> Optional[str]:
-    lines = [re.sub(r"\s+", " ", line.strip(" ,;")) for line in text.splitlines() if line.strip()]
-    legal_forms = ["gmbh", "ug", "gbr", "ag", "kg", "ohg", "e.k", "mbh", "ltd"]
+    text = _normalize_ocr_text(text)
+    raw_lines = [line for line in text.splitlines() if line.strip()]
+    lines = [_clean_vendor_line(line) for line in raw_lines if _clean_vendor_line(line)]
+    full_lower = "\n".join(lines).lower()
 
-    for line in lines[:25]:
+    # Bekannte Händler/Tankstellen/Receipt-Brands zuerst.
+    known = [
+        ("hem", "HEM Tankstelle"),
+        ("hem-tankstelle", "HEM Tankstelle"),
+        ("aral", "ARAL"),
+        ("shell", "Shell"),
+        ("esso", "Esso"),
+        ("jet", "JET"),
+        ("totalenergies", "TotalEnergies"),
+        ("avia", "AVIA"),
+        ("edeka", "EDEKA"),
+        ("rewe", "REWE"),
+        ("lidl", "Lidl"),
+        ("aldi", "ALDI"),
+        ("kaufland", "Kaufland"),
+        ("dm-drogerie", "dm-drogerie markt"),
+        ("rossmann", "Rossmann"),
+        ("ikea", "IKEA"),
+        ("amazon", "Amazon"),
+    ]
+    for needle, name in known:
+        if needle in full_lower:
+            return name
+
+    # Unternehmenszeile mit Rechtsform.
+    legal_forms = ["gmbh", "ug", "gbr", "ag", "kg", "ohg", "e.k", "mbh", "ltd"]
+    for line in lines[:30]:
         lower = line.lower()
         if any(form in lower for form in legal_forms):
             return line
 
-    # Tankstellen/Kassenbons: erste starke Händlerzeile nehmen
+    # Bei Kassenbons steht der Händler fast immer in den ersten 3-6 Zeilen.
+    bad_keywords = [
+        "rechnung", "invoice", "datum", "seite", "betrag", "summe", "total", "kundenbeleg",
+        "terminal", "beleg", "shop", "www", ".de", ".com", "terminalnummer", "kartenzahlung",
+        "straße", "strasse", "telefon", "tel", "fax", "ust", "steuer", "iban", "bic", "bon", "kasse",
+        "kundenservice", "versenden", "käufer", "zahlungsmethode"
+    ]
     for line in lines[:10]:
         lower = line.lower()
-        if any(k in lower for k in ["tankstelle", "hem", "aral", "shell", "esso", "jet", "totalenergies", "avia"]):
-            return line.strip(" ,")
-
-    bad_keywords = ["rechnung", "invoice", "datum", "seite", "betrag", "summe", "total", "kundenbeleg", "terminal", "beleg", "shop", "www", ".de", ".com"]
-    for line in lines[:15]:
-        if len(line) < 3 or len(line) > 80:
+        if len(line) < 3 or len(line) > 60:
             continue
-        lower = line.lower()
         if any(k in lower for k in bad_keywords):
+            continue
+        # Zeilen mit zu vielen Zahlen sind meist Adresse/Terminal.
+        if len(re.findall(r"\d", line)) > 4:
             continue
         if re.search(r"[A-Za-zÄÖÜäöüß]{3,}", line):
             return line.strip(" ,")
     return None
-
 
 def suggest_booking(text: str, vendor: Optional[str], vat_rate: Optional[Decimal]) -> dict:
     # Erst lokale SKR03-Regeln, dann optional OpenAI überschreiben, falls Key gesetzt und valides Ergebnis kommt.
@@ -297,15 +453,29 @@ def suggest_booking(text: str, vendor: Optional[str], vat_rate: Optional[Decimal
 
 
 def extract_fields(text: str) -> dict:
-    gross = find_amount(text, [
-        "Gesamtsumme", "Gesamtbetrag", "Gesamtpreis", "Bruttobetrag", "Rechnungssumme",
-        "Zu zahlen", "Amount due", "TOTAL", "Total", "Summe", "Betrag"
-    ])
+    text = _normalize_ocr_text(text)
+    gross = find_receipt_total(text)
+    if gross is None:
+        gross = find_amount(text, [
+            "Gesamtsumme", "Gesamtbetrag", "Gesamtpreis", "Bruttobetrag", "Rechnungssumme",
+            "Zu zahlen", "Amount due", "TOTAL", "Total", "Summe", "Betrag"
+        ])
     if gross is None:
         gross = find_largest_amount(text)
 
     vat = find_vat(text)
     vat_rate = find_vat_rate(text)
+    # Plausibilisierung: Bei 19% ist Vorsteuer ca. Brutto * 19/119, bei 7% ca. Brutto * 7/107.
+    if gross is not None and vat_rate is not None:
+        expected = None
+        if vat_rate == Decimal("19.00"):
+            expected = (gross * Decimal("19") / Decimal("119")).quantize(Decimal("0.01"))
+        elif vat_rate == Decimal("7.00"):
+            expected = (gross * Decimal("7") / Decimal("107")).quantize(Decimal("0.01"))
+        if expected is not None:
+            if vat is None or vat <= 0 or vat >= gross or abs(vat - expected) > Decimal("1.00"):
+                vat = expected
+
     vendor = find_vendor(text)
     booking = suggest_booking(text, vendor, vat_rate)
 
