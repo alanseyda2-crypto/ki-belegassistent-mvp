@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<a class="back" href="/">← Zurück</a>
+<section class="card">
+  <div class="section-header">
+    <div>
+      <p class="eyebrow">Lernfunktion</p>
+      <h1>Gespeicherte Kontierungsregeln</h1>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Lieferant</th>
+          <th>Kategorie</th>
+          <th>Konto</th>
+          <th>Gegenkonto</th>
+          <th>Steuer</th>
+          <th>Genutzt</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for rule in rules %}
+        <tr>
+          <td>{{ rule.vendor }}</td>
+          <td>{{ rule.category or '—' }}</td>
+          <td>{{ rule.account }}</td>
+          <td>{{ rule.contra_account }}</td>
+          <td>{{ rule.vat_key or '—' }}</td>
+          <td>{{ rule.times_used }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty">Noch keine Lernregeln gespeichert.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -78,3 +78,13 @@ pre { white-space: pre-wrap; background: #17151f; color: #f5f0ff; padding: 18px;
 .danger { background: #dc2626; margin-top: 14px; }
 .danger:hover { background: #b91c1c; }
 @media (max-width: 680px) { .section-header { align-items: flex-start; flex-direction: column; } }
+.hint {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid #e5dcff;
+  border-radius: 16px;
+  background: #fbf9ff;
+  color: #6d667d;
+  font-size: 0.95rem;
+}
+.actions{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}.edit-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:12px 0 24px}.edit-form label{font-weight:700;color:#6f687f}.edit-form input{width:100%;margin-top:7px;padding:13px 14px;border:1px solid #ded7ef;border-radius:14px;font:inherit;background:#fff}.edit-form .checkbox{grid-column:1/-1;display:flex;align-items:center;gap:10px}.edit-form .checkbox input{width:auto;margin:0}.hint strong{color:#5c35cf}

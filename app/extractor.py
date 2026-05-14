@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from pypdf import PdfReader
+from .accounting_ai import rule_based_skr03
 
 
 GERMAN_MONTHS = {
@@ -166,6 +167,28 @@ def find_vendor(text: str) -> Optional[str]:
     return None
 
 
+
+def find_vat_rate(text: str) -> Optional[Decimal]:
+    # Erkennt MwSt.-Sätze wie: MwSt. 7%, USt 19%, VAT 19%, 7% €3,27
+    patterns = [
+        r"(?:MwSt\.?|USt\.?|Umsatzsteuer|VAT|Tax)[^\n]{0,30}?(\d{1,2}(?:,\d{1,2})?)\s*%",
+        r"\b(7|19)\s*%[^\n]{0,40}(?:€|EUR|\d)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            raw = match.group(1).replace(',', '.')
+            try:
+                return Decimal(raw).quantize(Decimal("0.01"))
+            except (InvalidOperation, ValueError):
+                return None
+    return None
+
+
+def suggest_booking(text: str, vendor: Optional[str], vat_rate: Optional[Decimal]) -> dict:
+    return rule_based_skr03(text, vendor, vat_rate)
+
+
 def extract_fields(text: str) -> dict:
     gross = find_amount(text, [
         "Gesamtsumme", "Gesamtbetrag", "Gesamtpreis", "Bruttobetrag", "Rechnungssumme",
@@ -175,6 +198,8 @@ def extract_fields(text: str) -> dict:
         gross = find_largest_amount(text)
 
     vat = find_vat(text)
+    vat_rate = find_vat_rate(text)
+    booking = suggest_booking(text, find_vendor(text), vat_rate)
 
     return {
         "invoice_date": find_date(text),
@@ -182,5 +207,7 @@ def extract_fields(text: str) -> dict:
         "invoice_number": find_invoice_number(text),
         "gross_amount": gross,
         "vat_amount": vat,
+        "vat_rate": vat_rate,
+        **booking,
         "currency": "EUR" if "€" in text or "EUR" in text.upper() else None,
     }

@@ -4,7 +4,7 @@
   <div>
     <p class="eyebrow">MVP</p>
     <h1>KI-Belegassistent für vorbereitende Buchhaltung</h1>
-    <p>Belege hochladen, automatisch auslesen, nach Datum sortieren und strukturiert prüfen.</p>
+    <p>Belege hochladen, automatisch auslesen, nach Datum sortieren, SKR03-Vorschläge erhalten und als DATEV-CSV exportieren.</p>
   </div>
 </section>
 
@@ -14,6 +14,7 @@
     <input type="file" name="file" accept=".pdf,.jpg,.jpeg,.png,.webp" required>
     <button type="submit">Hochladen & erkennen</button>
   </form>
+  <p class="hint">Optional AI: In Railway eine Variable <strong>OPENAI_API_KEY</strong> setzen. Ohne Key läuft die SKR03-Regellogik.</p>
 </section>
 
 <section class="toolbar">
@@ -22,6 +23,8 @@
     <input type="month" name="month" value="{{ month or '' }}">
     <button type="submit">Filtern</button>
     <a href="/" class="link-button">Zurücksetzen</a>
+    <a href="/export/datev" class="link-button">DATEV-CSV exportieren</a>
+    <a href="/rules" class="link-button">Lernregeln</a>
   </form>
 </section>
 
@@ -39,6 +42,9 @@
           <th>Rechnungsnr.</th>
           <th>Betrag</th>
           <th>MwSt.</th>
+          <th>MwSt. %</th>
+          <th>SKR03</th>
+          <th>Quelle</th>
           <th>Status</th>
           <th></th>
         </tr>
@@ -51,11 +57,14 @@
           <td>{{ doc.invoice_number or '—' }}</td>
           <td>{% if doc.gross_amount %}{{ '%.2f'|format(doc.gross_amount) }} {{ doc.currency }}{% else %}—{% endif %}</td>
           <td>{% if doc.vat_amount %}{{ '%.2f'|format(doc.vat_amount) }} {{ doc.currency }}{% else %}—{% endif %}</td>
-          <td><span class="status {{ doc.status }}">{{ doc.status }}</span></td>
+          <td>{% if doc.vat_rate %}{{ '%.0f'|format(doc.vat_rate) }}%{% else %}—{% endif %}</td>
+          <td>{% if doc.account %}{{ doc.account }} → {{ doc.contra_account }}{% else %}—{% endif %}</td>
+          <td>{{ doc.booking_source or '—' }}</td>
+          <td><span class="status {{ doc.status }}">{% if doc.is_confirmed %}bestätigt{% else %}{{ doc.status }}{% endif %}</span></td>
           <td><a href="/documents/{{ doc.id }}">Details</a></td>
         </tr>
         {% else %}
-        <tr><td colspan="7" class="empty">Noch keine Belege hochgeladen.</td></tr>
+        <tr><td colspan="10" class="empty">Noch keine Belege hochgeladen.</td></tr>
         {% endfor %}
       </tbody>
     </table>
