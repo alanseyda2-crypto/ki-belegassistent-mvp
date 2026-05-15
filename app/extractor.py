@@ -188,7 +188,21 @@ def find_date(text: str):
         (r"\b(\d{2}/\d{2}/\d{4})\b", "%d/%m/%Y"),
         (r"\b(\d{1,2}/\d{1,2}/\d{2})\b", "%d/%m/%y"),
     ]
+
+    def _safe_date(y, m, d):
+        try:
+            y = int(y); m = int(m); d = int(d)
+            if y < 100:
+                # Kassenbons nutzen oft 27 04 23 unten rechts. 23 => 2023.
+                y += 2000 if y <= 69 else 1900
+            if not (2000 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31):
+                return None
+            return datetime(y, m, d).date()
+        except Exception:
+            return None
+
     def parse_from(s):
+        # Normale Datumsformate mit Punkt, Slash oder ISO.
         for pattern, fmt in date_patterns:
             m = re.search(pattern, s)
             if m:
@@ -196,6 +210,23 @@ def find_date(text: str):
                     return datetime.strptime(m.group(1), fmt).date()
                 except ValueError:
                     pass
+
+        # Kassenbon-Sonderfall: unten rechts steht oft "14:37 27 04 23" oder "27 04 2023"
+        # ohne Punkte. Das darf nicht mit Beträgen/Mengen verwechselt werden, daher nur bei
+        # Zeit-/Bon-Kontext oder am Zeilenende akzeptieren.
+        m = re.search(r"(?:\b\d{1,2}:\d{2}\b\s*)?(\b[0-3]?\d)\s+([01]?\d)\s+(20\d{2}|\d{2})\b\s*$", s)
+        if m and (re.search(r"\d{1,2}:\d{2}", s) or re.search(r"\b(kasse|bon|tse|steuer|nr|eur)\b", s, re.I) or len(s) < 45):
+            d = _safe_date(m.group(3), m.group(2), m.group(1))
+            if d:
+                return d
+
+        # OCR-Variante: "27.O4.23", "27,04,23" oder ähnliche Separatoren.
+        m = re.search(r"\b([0-3]?\d)\s*[.,;:/-]\s*([01]?\d)\s*[.,;:/-]\s*(20\d{2}|\d{2})\b", s)
+        if m:
+            d = _safe_date(m.group(3), m.group(2), m.group(1))
+            if d:
+                return d
+
         m = re.search(r"\b(\d{1,2})\.?:?\s+([A-Za-zÄÖÜäöüß]+)\s+(\d{4})\b", s, re.I)
         if m:
             month = GERMAN_MONTHS.get(m.group(2).lower().replace("ä", "ae"))
@@ -559,7 +590,7 @@ def ai_document_extraction(text: str, file_path: str | None = None, content_type
         )
         schema = {
             "vendor": "Lieferant/Händler",
-            "invoice_date": "YYYY-MM-DD oder null; echtes Rechnungs-/Belegdatum, nicht Zahlungsdatum",
+            "invoice_date": "YYYY-MM-DD oder null; echtes Rechnungs-/Belegdatum, nicht Zahlungsdatum. Bei Kassenbons steht das Datum oft unten rechts nach der Uhrzeit, z.B. 14:37 27 04 23 = 2023-04-27",
             "invoice_number": "echte Rechnungsnummer, sonst null bei Kassenbons",
             "gross_amount": "Brutto/Gesamtsumme als Zahl",
             "vat_amount": "MwSt/USt-Betrag als Zahl oder null",
