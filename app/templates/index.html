@@ -17,7 +17,15 @@
 
 <section class="toolbar">
   <form method="get">
-    <label>Monat filtern</label>
+    <label>Jahr</label>
+    <select name="year">
+      <option value="">Alle</option>
+      {% for y in available_years %}
+      <option value="{{ y }}" {% if year|string == y|string %}selected{% endif %}>{{ y }}</option>
+      {% endfor %}
+    </select>
+
+    <label>Monat</label>
     <input type="month" name="month" value="{{ month or '' }}">
     <button type="submit">Filtern</button>
     <a href="/" class="link-button">Zurücksetzen</a>
