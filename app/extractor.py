@@ -521,74 +521,174 @@ def find_vat(text: str) -> Optional[Decimal]:
     return None
 
 # ------------------------- Lieferant/Zahlung -------------------------
+
+MERCHANT_BLACKLIST_WORDS = [
+    "rechnung", "invoice", "datum", "seite", "betrag", "summe", "total", "kundenbeleg", "terminal",
+    "beleg", "www", "telefon", "tel", "fax", "ust", "steuer", "iban", "bic", "bon", "kasse",
+    "kundenservice", "käufer", "zahlungsmethode", "transaktion", "tse", "seriennr", "signatur",
+    "signaturzähler", "pruefwert", "prüfwert", "trace", "kartenzahlung", "mastercard", "visa",
+    "brutto", "netto", "mwst", "ust.", "eur", "bar", "karte", "kreditkarte", "debit", "uhr",
+    "menge", "stk", "preis", "einzelpreis", "zwischensumme", "postfach", "kundennummer",
+]
+
+MERCHANT_ADDRESS_WORDS = [
+    "straße", "strasse", "str.", "allee", "platz", "weg", "gasse", "damm", "ring", "chaussee",
+    "berlin", "kerpen", "dresden", "köln", "koeln", "hamburg", "münchen", "muenchen", "deutschland",
+]
+
+# Händlerlexikon mit OCR-Varianten. Das ist nicht als einzelner Sonderfall gedacht,
+# sondern als Merchant-Classification-Layer: bekannte Marken gewinnen gegen technische TSE-/Kassenzeilen.
+KNOWN_MERCHANTS = [
+    ("Netto Marken-Discount", [r"\bnetto\b", r"\bnett[o0]\b", r"\bne[t7][t7][o0]\b", r"\bneft[o0]\b", r"\bnert[o0]\b", r"marken[\s\.-]*discount", r"netto[\s\.-]*online"]),
+    ("HEM Tankstelle", [r"\bhem\b", r"hem[\s\.-]*tank", r"hem[\s\.-]*tankstelle"]),
+    ("Vodafone West GmbH", [r"vodafone", r"v[o0]daf[o0]ne"]),
+    ("Deutsche Telekom", [r"deutsche\s+telekom", r"\btelekom\b", r"t[-\s]*mobile"]),
+    ("O2", [r"\bo2\s*(shop|store|telefonica|germany|rechnung)\b", r"\btelefonica\b"]),
+    ("ARAL", [r"\baral\b"]), ("Shell", [r"\bshell\b"]), ("Esso", [r"\besso\b"]),
+    ("JET Tankstelle", [r"\bjet\s+tank", r"\bjet\b"]),
+    ("TotalEnergies", [r"total\s*energies", r"totalenergies"]), ("AVIA", [r"\bavia\b"]),
+    ("REWE", [r"\brewe\b"]), ("EDEKA", [r"\bedeka\b"]), ("Lidl", [r"\blidl\b"]),
+    ("ALDI", [r"\baldi\b"]), ("Kaufland", [r"\bkaufland\b"]), ("PENNY", [r"\bpenny\b"]),
+    ("NORMA", [r"\bnorma\b"]), ("METRO", [r"\bmetro\b"]),
+    ("dm-drogerie markt", [r"dm[\s\.-]*drogerie", r"\bdm\s+markt\b"]),
+    ("Rossmann", [r"rossmann"]), ("Amazon", [r"amazon"]),
+    ("OBI", [r"\bobi\b"]), ("Hornbach", [r"hornbach"]), ("BAUHAUS", [r"bauhaus"]),
+    ("IKEA", [r"\bikea\b"]), ("McDonald's", [r"mcdonald", r"mc donald"]),
+    ("Burger King", [r"burger\s+king"]), ("Starbucks", [r"starbucks"]),
+]
+
+
+def _merchant_match_text(s: str) -> str:
+    """OCR-normalisierte Zeichenkette nur fürs Händler-Matching."""
+    s = (s or "").lower()
+    s = s.replace("0", "o").replace("1", "l").replace("|", "l")
+    s = s.replace("€", "e")
+    s = re.sub(r"[^a-zäöüß0-9 .\-/]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _bad_vendor_candidate(line: str, *, receipt_like: bool = False) -> bool:
+    low = line.lower().strip()
+    if not low or len(low) < 2:
+        return True
+    if any(w in low for w in MERCHANT_BLACKLIST_WORDS):
+        # Ausnahme: Netto als Markenname darf nicht durch Wort "netto" als Rechnungsfeld geblockt werden,
+        # wenn die Zeile wirklich wie ein Händlerkopf aussieht.
+        if not re.search(r"\bnetto\b|marken[\s\.-]*discount", low, re.I):
+            return True
+    if any(w in low for w in MERCHANT_ADDRESS_WORDS):
+        return True
+    digit_count = len(re.findall(r"\d", line))
+    alpha_count = len(re.findall(r"[A-Za-zÄÖÜäöüß]", line))
+    if digit_count > max(3, alpha_count):
+        return True
+    if re.search(r"\b\d{4,}\b", line):
+        return True
+    if re.search(r"\b\d{1,2}[:.]\d{2}\b", line):
+        return True
+    if receipt_like and len(line) > 45:
+        return True
+    return False
+
+
+def _known_merchant_candidates(lines: list[str]) -> list[tuple[int, str, str]]:
+    candidates: list[tuple[int, str, str]] = []
+    # Kopfbereich stärker gewichten; Footer/TSE-Zeilen sehr schwach.
+    for idx, line in enumerate(lines[:30]):
+        norm = _merchant_match_text(line)
+        joined_next = norm
+        if idx + 1 < len(lines):
+            joined_next += " " + _merchant_match_text(lines[idx + 1])
+        for merchant, patterns in KNOWN_MERCHANTS:
+            for pat in patterns:
+                if re.search(pat, joined_next, re.I):
+                    score = 1300 - idx * 18
+                    # Markenlogo in den ersten 5 Zeilen ist extrem stark.
+                    if idx <= 5:
+                        score += 250
+                    # TSE-/Kassen-Umfeld darf bekannte Händler nicht fälschen.
+                    if any(b in norm for b in ["tse", "serien", "kasse", "transaktion", "terminal"]):
+                        score -= 600
+                    # O2 nur mit echtem Telekommunikations-Kontext akzeptieren.
+                    if merchant == "O2" and not re.search(r"o2\s*(shop|store|rechnung)|telefonica|mobilfunk|dsl|internet", joined_next, re.I):
+                        score -= 900
+                    candidates.append((score, merchant, f"known:{pat}:{line}"))
+    return candidates
+
+
+def _fuzzy_brand_candidates(lines: list[str]) -> list[tuple[int, str, str]]:
+    candidates: list[tuple[int, str, str]] = []
+    try:
+        from difflib import SequenceMatcher
+        brand_words = {
+            "netto": "Netto Marken-Discount", "hem": "HEM Tankstelle", "vodafone": "Vodafone West GmbH",
+            "telekom": "Deutsche Telekom", "edeka": "EDEKA", "rewe": "REWE", "lidl": "Lidl",
+            "aldi": "ALDI", "kaufland": "Kaufland", "rossmann": "Rossmann", "aral": "ARAL",
+            "shell": "Shell", "esso": "Esso", "penny": "PENNY", "norma": "NORMA", "metro": "METRO",
+            "hornbach": "Hornbach", "bauhaus": "BAUHAUS", "amazon": "Amazon",
+        }
+        for idx, line in enumerate(lines[:15]):
+            if _bad_vendor_candidate(line, receipt_like=True) and not re.search(r"netto|hem|vodafone|telekom", line, re.I):
+                continue
+            compact = re.sub(r"[^a-z0-9äöüß]", "", _merchant_match_text(line))
+            tokens = [compact] + [re.sub(r"[^a-z0-9äöüß]", "", _merchant_match_text(t)) for t in re.split(r"\s+", line)]
+            for brand, canonical in brand_words.items():
+                best = max((SequenceMatcher(None, tok[:max(len(brand)+2, 4)], brand).ratio() for tok in tokens if tok), default=0)
+                if best >= 0.76:
+                    candidates.append((1050 - idx * 20 + int(best * 100), canonical, f"fuzzy:{line}"))
+    except Exception:
+        pass
+    return candidates
+
+
+def _generic_header_candidates(lines: list[str], receipt_like: bool) -> list[tuple[int, str, str]]:
+    candidates: list[tuple[int, str, str]] = []
+    legal_forms = ["gmbh", "ug", "gbr", "ag", "kg", "ohg", "e.k", "mbh", "ltd"]
+    # 1) Juristische Namen und Firmennamen im oberen Dokumentbereich.
+    for idx, line in enumerate(lines[:35]):
+        low = line.lower()
+        if any(form in low for form in legal_forms) and not _bad_vendor_candidate(line, receipt_like=receipt_like):
+            score = 900 - idx * 8
+            candidates.append((score, line, f"legal:{line}"))
+    # 2) Bei Kassenbons: erste plausible Logo-/Kopfzeile. Keine Technik-/Adresszeile.
+    head_limit = 8 if receipt_like else 15
+    for idx, line in enumerate(lines[:head_limit]):
+        if _bad_vendor_candidate(line, receipt_like=receipt_like):
+            continue
+        if not re.search(r"[A-Za-zÄÖÜäöüß]{3,}", line):
+            continue
+        score = 620 - idx * 25
+        # Sehr kurze, markenartige Zeilen bevorzugen.
+        if len(line) <= 24:
+            score += 120
+        candidates.append((score, line.strip(" ,;:-"), f"header:{line}"))
+    return candidates
+
+
 def _vendor_candidates(text: str) -> list[tuple[int, str, str]]:
     text = _normalize_ocr_text(text or "")
     raw_lines = _lines(text)
     lines = [_clean_vendor_line(l) for l in raw_lines if _clean_vendor_line(l)]
-    full = "\n".join(lines).lower()
+    receipt_like = _looks_like_receipt(text)
     candidates: list[tuple[int, str, str]] = []
+    candidates.extend(_known_merchant_candidates(lines))
+    candidates.extend(_fuzzy_brand_candidates(lines))
+    candidates.extend(_generic_header_candidates(lines, receipt_like))
 
-    # Starke Handelsnamen + häufige OCR-Varianten. Keine Einzellogik pro Bon, sondern generische Merchant-Lexikon-Erkennung.
-    known = [
-        (["vodafone", "vodaf0ne"], "Vodafone West GmbH"),
-        (["telekom", "deutsche telekom"], "Deutsche Telekom"),
-        (["netto", "nefto", "netfo", "marken-discount", "netto-online", "netto ohline"], "Netto Marken-Discount"),
-        (["hem", "hem tankstelle"], "HEM Tankstelle"),
-        (["aral"], "ARAL"), (["shell"], "Shell"), (["esso"], "Esso"), (["jet tankstelle", " jet "], "JET"),
-        (["totalenergies", "total energies"], "TotalEnergies"), (["avia"], "AVIA"),
-        (["edeka"], "EDEKA"), (["rewe"], "REWE"), (["lidl"], "Lidl"), (["aldi"], "ALDI"),
-        (["kaufland"], "Kaufland"), (["dm-drogerie", "dm drogerie"], "dm-drogerie markt"),
-        (["rossmann"], "Rossmann"), (["ikea"], "IKEA"), (["amazon"], "Amazon"),
-        (["obi"], "OBI"), (["hornbach"], "Hornbach"), (["bauhaus"], "BAUHAUS"),
-        (["metro"], "METRO"), (["penny"], "PENNY"), (["norma"], "NORMA"), (["real"], "real"),
-        (["burger king"], "Burger King"), (["mcdonald"], "McDonald's"), (["starbucks"], "Starbucks"),
-        (["o2", "telefonica"], "O2"),
-    ]
-    for needles, name in known:
-        for needle in needles:
-            n = needle.strip().lower()
-            if len(n) <= 3:
-                if re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", full):
-                    candidates.append((900, name, f"known:{needle}"))
-            elif n in full:
-                candidates.append((950, name, f"known:{needle}"))
-
-    # Fuzzy Logo-/Kopfbereich: die ersten 12 Zeilen sind bei Kassenbons fast immer Händler/Adresse.
-    try:
-        from difflib import SequenceMatcher
-        brand_words = {
-            "netto": "Netto Marken-Discount", "vodafone": "Vodafone West GmbH", "telekom": "Deutsche Telekom",
-            "edeka": "EDEKA", "rewe": "REWE", "lidl": "Lidl", "aldi": "ALDI", "kaufland": "Kaufland",
-            "rossmann": "Rossmann", "hem": "HEM Tankstelle", "aral": "ARAL", "shell": "Shell", "esso": "Esso"
-        }
-        for idx, line in enumerate(lines[:12]):
-            low = re.sub(r"[^a-z0-9äöüß]", "", line.lower())
-            for brand, canonical in brand_words.items():
-                ratio = SequenceMatcher(None, low[:max(len(brand)+3, 8)], brand).ratio()
-                if ratio >= 0.72:
-                    candidates.append((780 - idx * 10, canonical, f"fuzzy:{line}"))
-    except Exception:
-        pass
-
-    # Juristische Firmennamen sind sehr stark, aber Kopfzeilen bevorzugen.
-    legal_forms = ["gmbh", "ug", "gbr", "ag", "kg", "ohg", "e.k", "mbh", "ltd"]
-    for idx, line in enumerate(lines[:35]):
-        low = line.lower()
-        if any(form in low for form in legal_forms):
-            # Adress-/Servicezeilen abwerten
-            score = 760 - idx * 3
-            if any(b in low for b in ["kundenservice", "postfach", "amtsgericht", "hrb", "sitz der gesellschaft"]):
-                score -= 300
-            candidates.append((score, line, f"legal:{line}"))
-
-    bad = ["rechnung", "invoice", "datum", "seite", "betrag", "summe", "total", "kundenbeleg", "terminal", "beleg", "www", ".de", ".com", "straße", "strasse", "allee", "platz", "telefon", "tel", "fax", "ust", "steuer", "iban", "bic", "bon", "kasse", "kundenservice", "käufer", "zahlungsmethode", "transaktion", "tse", "seriennr"]
-    for idx, line in enumerate(lines[:10]):
-        low = line.lower()
-        if 3 <= len(line) <= 60 and not any(k in low for k in bad) and len(re.findall(r"\d", line)) <= 4 and re.search(r"[A-Za-zÄÖÜäöüß]{3,}", line):
-            # erste Logo-/Header-Zeile ist bei unbekannten Händlern der beste Fallback
-            candidates.append((520 - idx * 15, line.strip(" ,"), f"header:{line}"))
-    return candidates
-
+    # Dedup: gleicher Händler nur mit bestem Score.
+    best: dict[str, tuple[int, str, str]] = {}
+    for score, name, reason in candidates:
+        clean_name = _clean_vendor_line(name)
+        if not clean_name:
+            continue
+        low = clean_name.lower()
+        # Finale harte Sperre gegen TSE-/Kassen-/Footer-Müll als Lieferant.
+        if _bad_vendor_candidate(clean_name, receipt_like=receipt_like) and clean_name not in {m[0] for m in KNOWN_MERCHANTS}:
+            continue
+        if low not in best or score > best[low][0]:
+            best[low] = (score, clean_name, reason)
+    return sorted(best.values(), key=lambda x: x[0], reverse=True)
 
 def find_vendor(text: str) -> Optional[str]:
     candidates = _vendor_candidates(text)
