@@ -7,44 +7,109 @@
       <p class="eyebrow">Belegdetails</p>
       <h1>{{ doc.original_filename }}</h1>
     </div>
-
   </div>
 
-  <div class="grid">
-    <div><strong>Datum</strong><span>{{ doc.invoice_date or '—' }}</span></div>
-    <div><strong>Lieferant</strong><span>{{ doc.vendor or '—' }}</span></div>
-    <div><strong>Rechnungsnummer</strong><span>{{ doc.invoice_number or '—' }}</span></div>
-    <div><strong>Brutto</strong><span>{% if doc.gross_amount %}{{ '%.2f'|format(doc.gross_amount) }} {{ doc.currency }}{% else %}—{% endif %}</span></div>
-    <div><strong>MwSt.</strong><span>{% if doc.vat_amount %}{{ '%.2f'|format(doc.vat_amount) }} {{ doc.currency }}{% else %}—{% endif %}</span></div>
-    <div><strong>MwSt. Satz</strong><span>{% if doc.vat_rate %}{{ '%.0f'|format(doc.vat_rate) }}%{% else %}—{% endif %}</span></div>
-    <div><strong>Status</strong><span>{% if doc.is_confirmed %}bestätigt{% else %}{{ doc.status }}{% endif %}</span></div>
-  </div>
+  <h2>Erkannte Informationen prüfen & bearbeiten</h2>
+  <form class="edit-form" action="/documents/{{ doc.id }}/update" method="post">
+    <label>Datum
+      <input type="date" name="invoice_date" value="{{ doc.invoice_date or '' }}">
+    </label>
+    <label>Lieferant
+      <input name="vendor" value="{{ doc.vendor or '' }}" placeholder="z. B. HEM Tankstelle">
+    </label>
+    <label>Rechnungsnummer / Belegnummer
+      <input name="invoice_number" value="{{ doc.invoice_number or '' }}" placeholder="bei Kassenbons optional leer lassen">
+    </label>
+    <label>Brutto-Betrag
+      <input name="gross_amount" value="{% if doc.gross_amount is not none %}{{ '%.2f'|format(doc.gross_amount) }}{% endif %}" placeholder="75,57">
+    </label>
+    <label>Netto-Betrag
+      <input name="net_amount" value="{% if doc.net_amount is not none %}{{ '%.2f'|format(doc.net_amount) }}{% endif %}" placeholder="63,50">
+    </label>
+    <label>MwSt.-Betrag
+      <input name="vat_amount" value="{% if doc.vat_amount is not none %}{{ '%.2f'|format(doc.vat_amount) }}{% endif %}" placeholder="12,07">
+    </label>
+    <label>MwSt.-Satz %
+      <input name="vat_rate" value="{% if doc.vat_rate is not none %}{{ '%.2f'|format(doc.vat_rate) }}{% endif %}" placeholder="19">
+    </label>
+    <label>Währung
+      <input name="currency" value="{{ doc.currency or 'EUR' }}">
+    </label>
+    <label>Status
+      <select name="status">
+        <option value="prüfen" {% if doc.status == 'prüfen' %}selected{% endif %}>prüfen</option>
+        <option value="erkannt" {% if doc.status == 'erkannt' %}selected{% endif %}>erkannt</option>
+        <option value="kontiert" {% if doc.status == 'kontiert' %}selected{% endif %}>kontiert</option>
+        <option value="exportbereit" {% if doc.status == 'exportbereit' %}selected{% endif %}>exportbereit</option>
+      </select>
+    </label>
 
-  <h2>SKR03-Kontierung</h2>
-  <form class="edit-form" action="/documents/{{ doc.id }}/correct" method="post">
-    <label>Kategorie <input name="booking_category" value="{{ doc.booking_category or '' }}"></label>
-    <label>Konto <input name="account" value="{{ doc.account or '' }}" required></label>
-    <label>Gegenkonto <input name="contra_account" value="{{ doc.contra_account or '1200' }}" required></label>
-    <label>Zahlungsart <input name="payment_method" value="{{ doc.payment_method or 'Bank' }}"></label>
-    <label>Steuerschlüssel <input name="vat_key" value="{{ doc.vat_key or '' }}"></label>
-    <label>Buchungstext <input name="booking_text" value="{{ doc.booking_text or '' }}"></label>
-    <label>Sicherheit <input value="{% if doc.booking_confidence %}{{ '%.0f'|format(doc.booking_confidence * 100) }}%{% else %}—{% endif %}" disabled></label>
-    <label class="checkbox"><input type="checkbox" name="save_rule" value="1" checked> Für diesen Lieferanten merken</label>
-    <button type="submit">Kontierung speichern</button>
+    <label>Kategorie
+      <input name="booking_category" value="{{ doc.booking_category or '' }}" placeholder="Kfz-Kosten, Porto, Software ...">
+    </label>
+    <label>Konto SKR03
+      <input name="account" value="{{ doc.account or '' }}" placeholder="z. B. 4530">
+    </label>
+    <label>Gegenkonto
+      <input name="contra_account" value="{{ doc.contra_account or '1200' }}" placeholder="1200 Bank oder 1000 Kasse">
+    </label>
+    <label>Zahlungsart
+      <input name="payment_method" value="{{ doc.payment_method or '' }}" placeholder="Bar, Bank, Kreditkarte/Bank">
+    </label>
+    <label>Steuerschlüssel
+      <input name="vat_key" value="{{ doc.vat_key or '' }}" placeholder="19% Vorsteuer">
+    </label>
+    <label>Buchungstext
+      <input name="booking_text" value="{{ doc.booking_text or '' }}" placeholder="kurzer Buchungstext">
+    </label>
+    <label>Sicherheit %
+      <input name="booking_confidence" value="{% if doc.booking_confidence is not none %}{{ '%.0f'|format(doc.booking_confidence * 100) }}{% endif %}" placeholder="z. B. 85">
+    </label>
+
+    <label class="checkbox"><input type="checkbox" name="save_rule" value="1" checked> Korrektur als Lernregel für diesen Lieferanten speichern</label>
+    <button type="submit">Alle Änderungen speichern</button>
   </form>
 
   <div class="actions">
     <form action="/documents/{{ doc.id }}/ai-booking" method="post">
-      <button type="submit">Vorschlag neu berechnen</button>
+      <button type="submit">KI-Vorschlag neu berechnen</button>
     </form>
     <form action="/documents/{{ doc.id }}/confirm" method="post">
       <button type="submit">Bestätigen & lernen</button>
     </form>
   </div>
 
-  <p class="hint">DATEV-Export bitte erst nach Prüfung/Bestätigung nutzen. Die Kontierung ist ein Vorschlag für vorbereitende Buchhaltung.</p>
+  <p class="hint">Die KI macht nur Vorschläge. Du kannst jede Angabe korrigieren. Jede Änderung wird im Änderungsprotokoll gespeichert und kann für Lernregeln genutzt werden.</p>
 
-  <div class="actions">
+  <h2>Änderungsprotokoll</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Zeit</th>
+          <th>Feld</th>
+          <th>Alt</th>
+          <th>Neu</th>
+          <th>Quelle</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td>{{ log.created_at.strftime('%d.%m.%Y %H:%M') if log.created_at else '' }}</td>
+          <td>{{ log.field_name }}</td>
+          <td>{{ log.old_value or '—' }}</td>
+          <td>{{ log.new_value or '—' }}</td>
+          <td>{{ log.source }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">Noch keine Änderungen gespeichert.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="actions bottom-actions">
     <a class="link-button" href="/documents/{{ doc.id }}/download">Beleg herunterladen</a>
     <form action="/documents/{{ doc.id }}/delete" method="post" onsubmit="return confirm('Beleg wirklich löschen?')">
       <button class="danger" type="submit">Beleg löschen</button>

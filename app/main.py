@@ -2,7 +2,7 @@ import csv
 import io
 import shutil
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc, text
 
 from .database import Base, engine, SessionLocal
-from .models import Document, BookingRule
+from .models import Document, BookingRule, AuditLog
 from .extractor import extract_text, extract_fields
 from .accounting_ai import ai_skr03_suggestion, rule_based_skr03
 
@@ -28,6 +28,7 @@ Base.metadata.create_all(bind=engine)
 
 def ensure_columns():
     doc_columns = [
+        ("net_amount", "NUMERIC(10,2)"),
         ("vat_rate", "NUMERIC(5,2)"),
         ("booking_category", "VARCHAR(255)"),
         ("account", "VARCHAR(50)"),
@@ -58,6 +59,52 @@ def get_db():
     finally:
         db.close()
 
+
+
+
+def parse_date_value(value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def parse_decimal_value(value: str):
+    value = (value or "").strip().replace("€", "").replace("EUR", "")
+    if not value:
+        return None
+    value = value.replace(".", "").replace(",", ".") if "," in value else value
+    try:
+        return Decimal(value).quantize(Decimal("0.01"))
+    except Exception:
+        return None
+
+
+def value_to_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
+
+
+def set_with_audit(db: Session, doc: Document, field: str, new_value, source: str = "user"):
+    old_value = getattr(doc, field)
+    if value_to_text(old_value) == value_to_text(new_value):
+        return
+    db.add(AuditLog(
+        document_id=doc.id,
+        field_name=field,
+        old_value=value_to_text(old_value),
+        new_value=value_to_text(new_value),
+        source=source,
+    ))
+    setattr(doc, field, new_value)
 
 def apply_learned_rule(db: Session, doc: Document, fields: dict) -> dict:
     vendor = fields.get("vendor")
@@ -147,6 +194,12 @@ def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db))
     dummy = Document(vendor=fields.get("vendor"))
     fields = apply_learned_rule(db, dummy, fields)
 
+    if fields.get("net_amount") is None and fields.get("gross_amount") is not None and fields.get("vat_amount") is not None:
+        try:
+            fields["net_amount"] = (fields.get("gross_amount") - fields.get("vat_amount")).quantize(Decimal("0.01"))
+        except Exception:
+            pass
+
     doc = Document(
         filename=stored_name,
         original_filename=file.filename,
@@ -157,6 +210,7 @@ def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db))
         vendor=fields.get("vendor"),
         invoice_number=fields.get("invoice_number"),
         gross_amount=fields.get("gross_amount"),
+        net_amount=fields.get("net_amount"),
         vat_amount=fields.get("vat_amount"),
         vat_rate=fields.get("vat_rate"),
         booking_category=fields.get("booking_category"),
@@ -179,7 +233,63 @@ def document_detail(document_id: int, request: Request, db: Session = Depends(ge
     doc = db.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Beleg nicht gefunden")
-    return templates.TemplateResponse("detail.html", {"request": request, "doc": doc})
+    logs = db.query(AuditLog).filter(AuditLog.document_id == document_id).order_by(desc(AuditLog.created_at)).limit(50).all()
+    return templates.TemplateResponse("detail.html", {"request": request, "doc": doc, "logs": logs})
+
+
+
+
+@app.post("/documents/{document_id}/update")
+def update_document_details(
+    document_id: int,
+    invoice_date: str = Form(""),
+    vendor: str = Form(""),
+    invoice_number: str = Form(""),
+    gross_amount: str = Form(""),
+    net_amount: str = Form(""),
+    vat_amount: str = Form(""),
+    vat_rate: str = Form(""),
+    currency: str = Form("EUR"),
+    status: str = Form("prüfen"),
+    booking_category: str = Form(""),
+    account: str = Form(""),
+    contra_account: str = Form(""),
+    payment_method: str = Form(""),
+    vat_key: str = Form(""),
+    booking_text: str = Form(""),
+    booking_confidence: str = Form(""),
+    save_rule: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    doc = db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Beleg nicht gefunden")
+
+    set_with_audit(db, doc, "invoice_date", parse_date_value(invoice_date))
+    set_with_audit(db, doc, "vendor", vendor.strip() or None)
+    set_with_audit(db, doc, "invoice_number", invoice_number.strip() or None)
+    set_with_audit(db, doc, "gross_amount", parse_decimal_value(gross_amount))
+    set_with_audit(db, doc, "net_amount", parse_decimal_value(net_amount))
+    set_with_audit(db, doc, "vat_amount", parse_decimal_value(vat_amount))
+    set_with_audit(db, doc, "vat_rate", parse_decimal_value(vat_rate))
+    set_with_audit(db, doc, "currency", (currency or "EUR").strip() or "EUR")
+    set_with_audit(db, doc, "status", (status or "prüfen").strip())
+    set_with_audit(db, doc, "booking_category", booking_category.strip() or None)
+    set_with_audit(db, doc, "account", account.strip() or None)
+    set_with_audit(db, doc, "contra_account", contra_account.strip() or None)
+    set_with_audit(db, doc, "payment_method", payment_method.strip() or None)
+    set_with_audit(db, doc, "vat_key", vat_key.strip() or None)
+    set_with_audit(db, doc, "booking_text", booking_text.strip() or None)
+    conf = parse_decimal_value(booking_confidence)
+    if conf is not None and conf > 1:
+        conf = (conf / Decimal("100")).quantize(Decimal("0.01"))
+    set_with_audit(db, doc, "booking_confidence", conf)
+
+    doc.is_confirmed = True
+    if save_rule:
+        create_or_update_rule(db, doc)
+    db.commit()
+    return RedirectResponse(url=f"/documents/{document_id}", status_code=303)
 
 
 @app.post("/documents/{document_id}/ai-booking")
@@ -191,7 +301,7 @@ def recalc_ai_booking(document_id: int, db: Session = Depends(get_db)):
     if not ai_booking:
         ai_booking = rule_based_skr03(doc.ocr_text or "", doc.vendor, doc.vat_rate)
     for key, value in ai_booking.items():
-        setattr(doc, key, value)
+        set_with_audit(db, doc, key, value, source="ai")
     db.commit()
     return RedirectResponse(url=f"/documents/{document_id}", status_code=303)
 
@@ -211,13 +321,13 @@ def correct_booking(
     doc = db.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Beleg nicht gefunden")
-    doc.booking_category = booking_category
-    doc.account = account
-    doc.contra_account = contra_account
-    doc.payment_method = payment_method
-    doc.vat_key = vat_key
-    doc.booking_text = booking_text
-    doc.booking_confidence = Decimal("1.00")
+    set_with_audit(db, doc, "booking_category", booking_category.strip() or None)
+    set_with_audit(db, doc, "account", account.strip() or None)
+    set_with_audit(db, doc, "contra_account", contra_account.strip() or None)
+    set_with_audit(db, doc, "payment_method", payment_method.strip() or None)
+    set_with_audit(db, doc, "vat_key", vat_key.strip() or None)
+    set_with_audit(db, doc, "booking_text", booking_text.strip() or None)
+    set_with_audit(db, doc, "booking_confidence", Decimal("1.00"))
     doc.is_confirmed = True
     if save_rule:
         create_or_update_rule(db, doc)
@@ -296,6 +406,7 @@ def export_datev(db: Session = Depends(get_db), confirmed_only: bool = False):
         "Kategorie",
         "Zahlungsart",
         "MwSt-Satz",
+        "Netto-Betrag",
         "MwSt-Betrag",
         "Bestätigt",
         "Dateiname",
@@ -314,6 +425,7 @@ def export_datev(db: Session = Depends(get_db), confirmed_only: bool = False):
 
         amount = f"{float(d.gross_amount or 0):.2f}".replace(".", ",")
         vat_amount = f"{float(d.vat_amount or 0):.2f}".replace(".", ",") if d.vat_amount is not None else ""
+        net_amount = f"{float(d.net_amount or 0):.2f}".replace(".", ",") if getattr(d, "net_amount", None) is not None else ""
         vat_rate_text = f"{vat_rate:.2f}".replace(".", ",") if d.vat_rate is not None else ""
         belegdatum = d.invoice_date.strftime("%d%m") if d.invoice_date else ""
         text_value = d.booking_text or d.vendor or d.original_filename or "Beleg"
@@ -332,6 +444,7 @@ def export_datev(db: Session = Depends(get_db), confirmed_only: bool = False):
             d.booking_category or "",
             d.payment_method or "",
             vat_rate_text,
+            net_amount,
             vat_amount,
             "ja" if d.is_confirmed else "nein",
             d.original_filename or d.filename,

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Date, DateTime, Numeric, Boolean
+from sqlalchemy import Column, Integer, String, Text, Date, DateTime, Numeric, Boolean, ForeignKey
 from datetime import datetime
 from .database import Base
 
@@ -16,6 +16,7 @@ class Document(Base):
     vendor = Column(String(255), nullable=True)
     invoice_number = Column(String(255), nullable=True)
     gross_amount = Column(Numeric(10, 2), nullable=True)
+    net_amount = Column(Numeric(10, 2), nullable=True)
     vat_amount = Column(Numeric(10, 2), nullable=True)
     vat_rate = Column(Numeric(5, 2), nullable=True)
     currency = Column(String(10), default="EUR")
@@ -48,3 +49,16 @@ class BookingRule(Base):
     times_used = Column(Integer, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id"), index=True, nullable=False)
+    field_name = Column(String(100), nullable=False)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    source = Column(String(50), default="user")
+    created_at = Column(DateTime, default=datetime.utcnow)
