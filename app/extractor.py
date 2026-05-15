@@ -594,7 +594,19 @@ def _bad_vendor_candidate(line: str, *, receipt_like: bool = False) -> bool:
 
 def _known_merchant_candidates(lines: list[str]) -> list[tuple[int, str, str]]:
     candidates: list[tuple[int, str, str]] = []
+    joined_all = " ".join(_merchant_match_text(l) for l in lines[:40])
+    joined_head = " ".join(_merchant_match_text(l) for l in lines[:10])
+
+    # Sehr starke globale Händler-Indikatoren. Diese gewinnen gegen zufällige OCR-Tokens.
+    if re.search(r"netto[\s\.-]*online|marken[\s\.-]*discount|\bnetto\b", joined_head, re.I) or re.search(r"netto[\s\.-]*online|marken[\s\.-]*discount", joined_all, re.I):
+        candidates.append((2600, "Netto Marken-Discount", "global:netto"))
+    if re.search(r"hem[\s\.-]*tank|hem[\s\.-]*tankstelle|\bhem\b.{0,25}tank", joined_head, re.I):
+        candidates.append((2600, "HEM Tankstelle", "global:hem-tank"))
+    if re.search(r"vodafone\s+west|vodafone", joined_head, re.I) or re.search(r"vodafone\s+west\s+gmbh", joined_all, re.I):
+        candidates.append((2500, "Vodafone West GmbH", "global:vodafone"))
+
     # Kopfbereich stärker gewichten; Footer/TSE-Zeilen sehr schwach.
+    # WICHTIG: kurze Marken wie HEM/O2 dürfen nicht fuzzy/zufällig irgendwo im Bon matchen.
     for idx, line in enumerate(lines[:30]):
         norm = _merchant_match_text(line)
         joined_next = norm
@@ -602,20 +614,32 @@ def _known_merchant_candidates(lines: list[str]) -> list[tuple[int, str, str]]:
             joined_next += " " + _merchant_match_text(lines[idx + 1])
         for merchant, patterns in KNOWN_MERCHANTS:
             for pat in patterns:
-                if re.search(pat, joined_next, re.I):
-                    score = 1300 - idx * 18
-                    # Markenlogo in den ersten 5 Zeilen ist extrem stark.
-                    if idx <= 5:
-                        score += 250
-                    # TSE-/Kassen-Umfeld darf bekannte Händler nicht fälschen.
-                    if any(b in norm for b in ["tse", "serien", "kasse", "transaktion", "terminal"]):
-                        score -= 600
-                    # O2 nur mit echtem Telekommunikations-Kontext akzeptieren.
-                    if merchant == "O2" and not re.search(r"o2\s*(shop|store|rechnung)|telefonica|mobilfunk|dsl|internet", joined_next, re.I):
-                        score -= 900
-                    candidates.append((score, merchant, f"known:{pat}:{line}"))
-    return candidates
+                if not re.search(pat, joined_next, re.I):
+                    continue
 
+                # HEM nur akzeptieren, wenn es im Kopfbereich steht und Tankstellen-Kontext hat.
+                # Sonst können zufällige OCR-Fragmente aus TSE/Prüfwert als HEM fehlinterpretiert werden.
+                if merchant == "HEM Tankstelle":
+                    if idx > 8:
+                        continue
+                    if not re.search(r"hem|tankstelle|tank|diesel|säulen|saeulen", joined_next, re.I):
+                        continue
+                    if re.search(r"netto|marken\s*discount|netto\s*online", joined_all, re.I) and not re.search(r"hem\s*tank|tankstelle", joined_head, re.I):
+                        continue
+
+                # O2 nur mit echtem Telekommunikations-Kontext akzeptieren, nie aus TSE-Müll.
+                if merchant == "O2" and not re.search(r"o2\s*(shop|store|rechnung)|telefonica|mobilfunk|dsl|internet", joined_next, re.I):
+                    continue
+
+                score = 1300 - idx * 18
+                # Markenlogo in den ersten 5 Zeilen ist extrem stark.
+                if idx <= 5:
+                    score += 250
+                # TSE-/Kassen-Umfeld darf bekannte Händler nicht fälschen.
+                if any(b in norm for b in ["tse", "serien", "kasse", "transaktion", "terminal", "pruefwert", "prüfwert", "signatur"]):
+                    score -= 900
+                candidates.append((score, merchant, f"known:{pat}:{line}"))
+    return candidates
 
 def _fuzzy_brand_candidates(lines: list[str]) -> list[tuple[int, str, str]]:
     candidates: list[tuple[int, str, str]] = []
@@ -634,8 +658,16 @@ def _fuzzy_brand_candidates(lines: list[str]) -> list[tuple[int, str, str]]:
             compact = re.sub(r"[^a-z0-9äöüß]", "", _merchant_match_text(line))
             tokens = [compact] + [re.sub(r"[^a-z0-9äöüß]", "", _merchant_match_text(t)) for t in re.split(r"\s+", line)]
             for brand, canonical in brand_words.items():
+                # Keine Fuzzy-Matches für sehr kurze Marken wie HEM, O2, dm, OBI.
+                # Diese erzeugen bei OCR-Müll extrem viele False Positives.
+                if len(brand) <= 3:
+                    continue
                 best = max((SequenceMatcher(None, tok[:max(len(brand)+2, 4)], brand).ratio() for tok in tokens if tok), default=0)
-                if best >= 0.76:
+                # Bei Kassenbons etwas strenger, damit "NTO/Kasse" nicht zu falschen Marken wird.
+                threshold = 0.82
+                if brand == "netto" and re.search(r"netto|nett[o0]|neft[o0]|nert[o0]|marken|discount", line, re.I):
+                    threshold = 0.72
+                if best >= threshold:
                     candidates.append((1050 - idx * 20 + int(best * 100), canonical, f"fuzzy:{line}"))
     except Exception:
         pass
@@ -885,9 +917,14 @@ def extract_fields(text: str, file_path: str | None = None, content_type: str | 
     ai_fields = ai_document_extraction(text, file_path=file_path, content_type=content_type)
     merged = _merge_ai_fields(local_fields, ai_fields)
 
-    # Finale Plausibilitätskorrektur: starker lokaler Lieferant/Datum aus Regelwerk gewinnt gegen schwache KI-Antworten.
-    strong_vendor = find_vendor(text)
-    if strong_vendor and (not merged.get("vendor") or str(merged.get("vendor")).strip().lower() in {"o2", "02", "unbekannt", "unknown"}):
+    # Finale Plausibilitätskorrektur: starker lokaler Lieferant/Datum aus Regelwerk gewinnt.
+    # Bei Kassenbons darf ein sehr starker Händler-Match auch eine falsche KI-/OCR-Antwort überschreiben.
+    vendor_cands = _vendor_candidates(text)
+    strong_vendor = vendor_cands[0][1] if vendor_cands else find_vendor(text)
+    strong_vendor_score = vendor_cands[0][0] if vendor_cands else 0
+    current_vendor = str(merged.get("vendor") or "").strip().lower()
+    weak_vendor_values = {"o2", "02", "unbekannt", "unknown", "", "none"}
+    if strong_vendor and (current_vendor in weak_vendor_values or strong_vendor_score >= 1800):
         merged["vendor"] = strong_vendor
     strong_date = find_date(text)
     if strong_date:
