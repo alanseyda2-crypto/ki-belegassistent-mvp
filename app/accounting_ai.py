@@ -52,9 +52,10 @@ def rule_based_skr03(text: str, vendor: Optional[str], vat_rate: Optional[Decima
     rules = [
         (["adobe", "software", "saas", "lizenz", "license", "cloud", "openai", "chatgpt"], "Software/Lizenzen", "4964", "Software- und Lizenzkosten"),
         (["hosting", "domain", "server", "aws", "azure", "google cloud", "hetzner", "strato", "ionos"], "IT/Hosting", "4806", "IT- und Hostingkosten"),
-        (["telefon", "telekom", "vodafone", "o2", "internet", "mobilfunk"], "Telefon/Internet", "4920", "Telefon- und Internetkosten"),
+        (["telefon", "telekom", "vodafone", "internet", "mobilfunk", " o2 ", "o2 germany"], "Telefon/Internet", "4920", "Telefon- und Internetkosten"),
         (["porto", "dhl", "dpd", "ups", "hermes", "versand", "standardversand"], "Porto/Versand", "4910", "Porto und Versand"),
         (["bürobedarf", "papier", "drucker", "toner", "stift", "notiz", "amazon business"], "Bürobedarf", "4930", "Bürobedarf"),
+        (["supermarkt", "discounter", "marken-discount", "netto", "edeka", "rewe", "lidl", "aldi", "kaufland", "lebensmittel", "eier", "bäckerei"], "Lebensmittel/Kassenbon prüfen", "4980", "Kassenbon/Lebensmittel prüfen"),
         (["bewirtung", "restaurant", "cafe", "café", "bäckerei", "essen", "lieferando"], "Bewirtung", "4650", "Bewirtungskosten"),
         (["hotel", "booking.com", "reise", "bahn", "db fernverkehr", "flug", "lufthansa"], "Reisekosten", "4660", "Reisekosten"),
         (["aral", "shell", "esso", "total", "totalenergies", "hem", "tankstelle", "kraftstoff", "diesel", "benzin", "säule", "saeule"], "Kfz-Kosten", "4530", "Kfz-Betriebskosten"),

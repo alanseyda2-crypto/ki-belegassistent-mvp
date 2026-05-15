@@ -80,6 +80,8 @@ def _normalize_ocr_text(text: str) -> str:
         "MIST": "MWST", "MWSI": "MWST", "MW5T": "MWST", "Mwst": "MwSt", "UST.": "USt",
         "€UR": "EUR", "EÜR": "EUR", "SROS5O": "BRUTTO", "0,0O": "0,00",
         "Rechnungsnr.": "Rechnungsnummer", "Re.-Nr.": "Rechnungsnummer",
+        "BRUTT0": "BRUTTO", "BRUTTD": "BRUTTO", "NEITD": "NETTO", "NETTD": "NETTO",
+        "MUST": "MWST", "MUSI": "MWST", "MW5I": "MWST", "MWST.": "MWST",
     }
     out = text or ""
     for wrong, right in replacements.items():
@@ -224,10 +226,13 @@ def find_date(text: str):
 # ------------------------- Rechnungsnummer -------------------------
 def find_invoice_number(text: str) -> Optional[str]:
     text = _normalize_ocr_text(text)
+    receipt_like = _looks_like_receipt(text)
     patterns = [
         r"(?:Rechnungsnummer|Rechnung\s*#|Rechnung\s*Nr\.?|Rechnungs\s*Nr\.?|Invoice\s*(?:No\.?|Number))[:\s#-]*([A-Z0-9][A-Z0-9\-/]{3,})",
-        r"(?:Dokumentnummer|Belegnummer|Beleg-Nr\.?)[:\s#-]*([A-Z0-9][A-Z0-9\-/]{5,})",
+        # Belegnummer nur bei Nicht-Kassenbons verwenden; bei Bons sind das oft Terminal/TSE/Transaktionsnummern.
     ]
+    if not receipt_like:
+        patterns.append(r"(?:Dokumentnummer|Belegnummer|Beleg-Nr\.?)[:\s#-]*([A-Z0-9][A-Z0-9\-/]{5,})")
     bad_context = ["terminal", "trace", "tse", "transaktion", "kartenzahlung", "seriennr", "verwendungszweck", "mandatsreferenz"]
     for pattern in patterns:
         for m in re.finditer(pattern, text, re.I):
@@ -265,8 +270,116 @@ def _amount_candidates_near_label(text: str, label_groups: list[tuple[list[str],
     return candidates
 
 
+
+
+def _looks_like_receipt(text: str) -> bool:
+    low = (text or "").lower()
+    return any(k in low for k in [
+        "summe", "total", "bar eur", "kartenzahlung", "mastercard", "visa", "girocard",
+        "tse", "terminal", "kasse", "kundenbeleg", "bon", "brutto", "netto", "mwst"
+    ])
+
+
+def _safe_amounts_after_keyword(text: str, keywords: list[str], max_chars: int = 120) -> list[tuple[int, Decimal, str]]:
+    """Findet Beträge direkt nach starken Summen-/Zahlungswörtern.
+    Robust gegen Datumswerte, TSE-Zeiten, Mengen, Liter und Nummern.
+    """
+    out: list[tuple[int, Decimal, str]] = []
+    flat = re.sub(r"[ \t]+", " ", _normalize_ocr_text(text or ""))
+    for kw in keywords:
+        pattern = re.compile(re.escape(kw), re.I)
+        for m in pattern.finditer(flat):
+            snippet = flat[m.start():m.end() + max_chars]
+            low = snippet.lower()
+            if any(bad in low for bad in ["mwst", "umsatzsteuer", "ust ", " ust", "netto für", "steuersatz"]):
+                # Summe/Total-Zeilen dürfen bleiben; reine Steuer-/Netto-Kontexte nicht.
+                if not any(good in low for good in ["summe", "total", "bar eur", "karte", "rechnungsbetrag", "zu zahlender"]):
+                    continue
+            vals = []
+            # Formate 2,49 / 2.49 / €2,49 / 2 49 nach starkem Keyword
+            vals.extend(_amounts_in_line(snippet, loose=True))
+            # OCR bei Bons trennt Dezimalstellen oft als Leerzeichen, z.B. "SUMME [T] 2 49".
+            if not vals:
+                for a,b in re.findall(r"\b(\d{1,4})\s+(\d{2})\b", snippet):
+                    try:
+                        vals.append(Decimal(f"{a}.{b}").quantize(Decimal("0.01")))
+                    except Exception:
+                        pass
+            for v in vals:
+                if _is_money(v):
+                    # Starke Keywords gewinnen; kleinere Werte werden bei Kassenbons NICHT schlechter bewertet.
+                    score = 1000
+                    if kw.lower() in ["rechnungsbetrag", "zu zahlender betrag", "gesamtsumme", "gesamtbetrag"]:
+                        score += 200
+                    if kw.lower() in ["summe", "total", "bar eur"]:
+                        score += 150
+                    out.append((score, v, snippet[:160]))
+    return out
+
+
+def _receipt_tax_table(text: str) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    """Erkennt typische Kassenbon-Steuertabellen:
+    MWST BRUTTO NETTO
+    b 7% 0,16 2,49 2,33
+    Rückgabe: (vat_rate, vat_amount, gross, net)
+    """
+    text = _normalize_ocr_text(text)
+    lines = _lines(text)
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if ("mwst" in low or "ust" in low) and "brutto" in low and "netto" in low:
+            window = " ".join(lines[i:i+4])
+            # Typisch: b 7% 0,16 2,49 2,33 oder b 73 0.16 2.49 2.33 (OCR)
+            m = re.search(r"\b(?:[a-z]\s*)?(7|19|73|1900|700|19,00|7,00)\s*%?\s+" + _amount_regex() + r"\s+" + _amount_regex() + r"\s+" + _amount_regex(), window, re.I)
+            if m:
+                raw_rate = m.group(1).replace(",", ".")
+                if raw_rate in ["73", "700"]:
+                    rate = Decimal("7.00")
+                elif raw_rate in ["1900"]:
+                    rate = Decimal("19.00")
+                else:
+                    rate = Decimal(raw_rate).quantize(Decimal("0.01"))
+                nums = [_parse_decimal(m.group(2)), _parse_decimal(m.group(3)), _parse_decimal(m.group(4))]
+                nums = [n for n in nums if n is not None]
+                if len(nums) >= 3:
+                    vat, gross, net = nums[0], nums[1], nums[2]
+                    if vat < gross and net < gross:
+                        return rate, vat, gross, net
+            # Fallback: Nach Header alle Geldwerte; Reihenfolge ist meist Steuer, Brutto, Netto.
+            vals = [v for v in _amounts_in_line(window, loose=True) if _is_money(v)]
+            if len(vals) >= 3:
+                # Prozentwerte 7/19 werden durch _is_money teils entfernt, bei OCR 73 ignorieren wir.
+                vals_sorted = vals[:3]
+                vat, gross, net = vals_sorted[0], vals_sorted[1], vals_sorted[2]
+                if vat < gross and net < gross:
+                    # Satz aus der Nähe erkennen; wenn Brutto-Netto ungefähr 7/19 passt, ableiten.
+                    diff = gross - net
+                    rate = None
+                    if abs(diff - (gross * Decimal("7") / Decimal("107")).quantize(Decimal("0.01"))) <= Decimal("0.05"):
+                        rate = Decimal("7.00")
+                    elif abs(diff - (gross * Decimal("19") / Decimal("119")).quantize(Decimal("0.01"))) <= Decimal("0.10"):
+                        rate = Decimal("19.00")
+                    return rate, vat, gross, net
+    return None, None, None, None
+
 def find_receipt_total(text: str) -> Optional[Decimal]:
     text = _normalize_ocr_text(text)
+    # 1) Strukturierte Kassenbon-Steuertabelle: Brutto aus Tabelle ist oft zuverlässiger als OCR-Zufall.
+    _rate, _vat, table_gross, _net = _receipt_tax_table(text)
+    # 2) Starke Summen-/Zahlungswörter direkt auswerten.
+    strong = _safe_amounts_after_keyword(text, [
+        "zu zahlender betrag", "rechnungsbetrag", "gesamtsumme", "gesamtbetrag", "gesamtpreis",
+        "total", "summe", "bar eur", "kartenzahlung", "mastercard", "visa", "girocard", "ec-karte"
+    ])
+    if strong:
+        # Wenn ein Wert doppelt vorkommt, z.B. SUMME und Bar EUR, ist er sehr plausibel.
+        counts = {}
+        for _, v, _ in strong:
+            counts[v] = counts.get(v, 0) + 1
+        strong.sort(key=lambda x: (counts.get(x[1], 0), x[0], -abs(x[1] - (table_gross or x[1]))), reverse=True)
+        return strong[0][1]
+    if table_gross is not None:
+        return table_gross
     label_groups = [
         (["zu zahlender betrag", "rechnungsbetrag", "zahlbetrag", "betrag fällig", "betrag faellig"], 1000),
         (["gesamtsumme", "gesamtbetrag", "gesamtpreis", "endsumme", "endbetrag"], 900),
@@ -306,6 +419,9 @@ def find_largest_amount(text: str) -> Optional[Decimal]:
 # ------------------------- MwSt -------------------------
 def find_vat_rate(text: str) -> Optional[Decimal]:
     text = _normalize_ocr_text(text)
+    table_rate, _table_vat, _table_gross, _table_net = _receipt_tax_table(text)
+    if table_rate is not None:
+        return table_rate
     # Erst nahe Steuer-Keywords.
     patterns = [
         r"(?:MwSt\.?|USt\.?|Umsatzsteuer|VAT|Tax)[^\n]{0,60}?(\d{1,2}(?:[,\.]\d{1,2})?)\s*%",
@@ -326,6 +442,9 @@ def find_vat_rate(text: str) -> Optional[Decimal]:
 
 def find_vat(text: str) -> Optional[Decimal]:
     text = _normalize_ocr_text(text)
+    _table_rate, table_vat, _table_gross, _table_net = _receipt_tax_table(text)
+    if table_vat is not None:
+        return table_vat
     lines = _lines(text)
     # 1) Vodafone/Telekom-Style: Umsatzsteuer 19% 1,91
     for line in lines:
@@ -366,7 +485,10 @@ def find_vendor(text: str) -> Optional[str]:
         ("rossmann", "Rossmann"), ("ikea", "IKEA"), ("amazon", "Amazon"),
     ]
     for needle, name in known:
-        if needle in full:
+        if needle in ["o2", "jet", "dm"]:
+            if re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])", full):
+                return name
+        elif needle in full:
             return name
     legal_forms = ["gmbh", "ug", "gbr", "ag", "kg", "ohg", "e.k", "mbh", "ltd"]
     for line in lines[:35]:
