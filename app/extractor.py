@@ -81,6 +81,7 @@ def _normalize_ocr_text(text: str) -> str:
         "€UR": "EUR", "EÜR": "EUR", "SROS5O": "BRUTTO", "0,0O": "0,00",
         "Rechnungsnr.": "Rechnungsnummer", "Re.-Nr.": "Rechnungsnummer",
         "BRUTT0": "BRUTTO", "BRUTTD": "BRUTTO", "NEITD": "NETTO", "NETTD": "NETTO",
+        "Nefto": "Netto", "Neft0": "Netto", "Nctto": "Netto", "NettO": "Netto", "NEITO": "NETTO",
         "MUST": "MWST", "MUSI": "MWST", "MW5I": "MWST", "MWST.": "MWST",
     }
     out = text or ""
@@ -175,84 +176,102 @@ def _clean_vendor_line(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip(" ,;:-")
 
 # ------------------------- Datum -------------------------
-def find_date(text: str):
-    text = _normalize_ocr_text(text)
-    lines = _lines(text)
-    # Label-Priorität: echte Rechnungs-/Belegdaten vor Zahlungs-/TSE-/Vertragsdaten.
-    positive = ["rechnungsdatum", "datum", "belegdatum", "bon-datum", "kaufdatum", "ausgestellt"]
-    negative = ["wird am", "eingezogen", "zahlungsziel", "fällig", "faellig", "tse-start", "tse-stop", "vertragsbeginn", "kündigung", "kuendigung", "mindestvertragslaufzeit"]
-    date_patterns = [
-        (r"\b(\d{2}\.\d{2}\.\d{4})\b", "%d.%m.%Y"),
-        (r"\b(\d{1,2}\.\d{1,2}\.\d{2})\b", "%d.%m.%y"),
-        (r"\b(\d{4}-\d{2}-\d{2})\b", "%Y-%m-%d"),
-        (r"\b(\d{2}/\d{2}/\d{4})\b", "%d/%m/%Y"),
-        (r"\b(\d{1,2}/\d{1,2}/\d{2})\b", "%d/%m/%y"),
-    ]
-
-    def _safe_date(y, m, d):
-        try:
-            y = int(y); m = int(m); d = int(d)
-            if y < 100:
-                # Kassenbons nutzen oft 27 04 23 unten rechts. 23 => 2023.
-                y += 2000 if y <= 69 else 1900
-            if not (2000 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31):
-                return None
-            return datetime(y, m, d).date()
-        except Exception:
+def _safe_date_from_parts(day, month, year):
+    try:
+        d = int(str(day).replace("O", "0").replace("o", "0"))
+        m = int(str(month).replace("O", "0").replace("o", "0"))
+        y = int(str(year).replace("O", "0").replace("o", "0"))
+        if y < 100:
+            y += 2000 if y <= 69 else 1900
+        if not (2000 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31):
             return None
-
-    def parse_from(s):
-        # Normale Datumsformate mit Punkt, Slash oder ISO.
-        for pattern, fmt in date_patterns:
-            m = re.search(pattern, s)
-            if m:
-                try:
-                    return datetime.strptime(m.group(1), fmt).date()
-                except ValueError:
-                    pass
-
-        # Kassenbon-Sonderfall: unten rechts steht oft "14:37 27 04 23" oder "27 04 2023"
-        # ohne Punkte. Das darf nicht mit Beträgen/Mengen verwechselt werden, daher nur bei
-        # Zeit-/Bon-Kontext oder am Zeilenende akzeptieren.
-        m = re.search(r"(?:\b\d{1,2}:\d{2}\b\s*)?(\b[0-3]?\d)\s+([01]?\d)\s+(20\d{2}|\d{2})\b\s*$", s)
-        if m and (re.search(r"\d{1,2}:\d{2}", s) or re.search(r"\b(kasse|bon|tse|steuer|nr|eur)\b", s, re.I) or len(s) < 45):
-            d = _safe_date(m.group(3), m.group(2), m.group(1))
-            if d:
-                return d
-
-        # OCR-Variante: "27.O4.23", "27,04,23" oder ähnliche Separatoren.
-        m = re.search(r"\b([0-3]?\d)\s*[.,;:/-]\s*([01]?\d)\s*[.,;:/-]\s*(20\d{2}|\d{2})\b", s)
-        if m:
-            d = _safe_date(m.group(3), m.group(2), m.group(1))
-            if d:
-                return d
-
-        m = re.search(r"\b(\d{1,2})\.?:?\s+([A-Za-zÄÖÜäöüß]+)\s+(\d{4})\b", s, re.I)
-        if m:
-            month = GERMAN_MONTHS.get(m.group(2).lower().replace("ä", "ae"))
-            if month:
-                try:
-                    return datetime(int(m.group(3)), month, int(m.group(1))).date()
-                except ValueError:
-                    pass
+        return datetime(y, m, d).date()
+    except Exception:
         return None
 
-    for line in lines:
+
+def _date_candidates(text: str) -> list[tuple[int, object, str]]:
+    """Robuste Datums-Kandidaten mit Scoring.
+    Ziel: echtes Beleg-/Rechnungsdatum vor Zahlungs-/TSE-/Vertragsdatum.
+    Erkennt auch Kassenzettel-Schreibweisen unten rechts: 14:37 27 04 23.
+    """
+    text = _normalize_ocr_text(text or "")
+    lines = _lines(text)
+    candidates: list[tuple[int, object, str]] = []
+    positive = [
+        "rechnungsdatum", "rechnung datum", "datum", "belegdatum", "bon-datum", "kaufdatum", "ausgestellt",
+        "rechnung vom", "invoice date", "date"
+    ]
+    negative = [
+        "wird am", "eingezogen", "zahlungsziel", "fällig", "faellig", "zahlbar", "lastschrift am",
+        "tse-start", "tse stop", "tse-stop", "vertragsbeginn", "kündigung", "kuendigung",
+        "mindestvertragslaufzeit", "lieferdatum", "leistungszeitraum", "bis ", "von "
+    ]
+
+    def score_line(line: str, index: int) -> int:
         low = line.lower()
-        if any(n in low for n in negative):
-            continue
+        score = 100
         if any(p in low for p in positive):
-            d = parse_from(line)
-            if d:
-                return d
-    for line in lines:
-        low = line.lower()
+            score += 500
+        if re.search(r"\b\d{1,2}:\d{2}\b", line):
+            score += 220
+        if any(k in low for k in ["kasse", "bon", "steuer-nr", "tse", "transaktion", "summe", "bar eur"]):
+            score += 120
+        # bei Kassenbons steht das Datum häufig in den letzten Zeilen
+        if index >= max(0, len(lines) - 8):
+            score += 140
         if any(n in low for n in negative):
-            continue
-        d = parse_from(line)
+            score -= 500
+        return score
+
+    for idx, line in enumerate(lines):
+        low = line.lower()
+        base = score_line(line, idx)
+        # dd.mm.yy/yyyy oder dd/mm/yyyy; OCR erlaubt O statt 0
+        for m in re.finditer(r"\b([0-3]?\d)\s*[./,;:-]\s*([O0]?[1-9]|1[0-2])\s*[./,;:-]\s*(20\d{2}|\d{2})\b", line, re.I):
+            d = _safe_date_from_parts(m.group(1), m.group(2), m.group(3))
+            if d:
+                candidates.append((base + 80, d, line))
+        # yyyy-mm-dd
+        for m in re.finditer(r"\b(20\d{2})-(\d{2})-(\d{2})\b", line):
+            d = _safe_date_from_parts(m.group(3), m.group(2), m.group(1))
+            if d:
+                candidates.append((base + 70, d, line))
+        # 14:37 27 04 23 oder 7507 ... 14:37 27 04 23
+        for m in re.finditer(r"(?:\b\d{1,2}:\d{2}\b\s*)\b([0-3]?\d)\s+([O0]?[1-9]|1[0-2])\s+(20\d{2}|\d{2})\b", line, re.I):
+            d = _safe_date_from_parts(m.group(1), m.group(2), m.group(3))
+            if d:
+                candidates.append((base + 260, d, line))
+        # Nur bei starkem Bon-/Zeitkontext: dd mm yy ohne Trennzeichen
+        if re.search(r"\b(\d{1,2}:\d{2}|kasse|bon|tse|steuer-nr|transaktion)\b", line, re.I):
+            for m in re.finditer(r"\b([0-3]?\d)\s+([O0]?[1-9]|1[0-2])\s+(20\d{2}|\d{2})\b", line, re.I):
+                d = _safe_date_from_parts(m.group(1), m.group(2), m.group(3))
+                if d:
+                    candidates.append((base + 160, d, line))
+        # 08. Mai 2026
+        for m in re.finditer(r"\b(\d{1,2})\.?\s+([A-Za-zÄÖÜäöüß]+)\s+(20\d{2})\b", line, re.I):
+            month = GERMAN_MONTHS.get(m.group(2).lower().replace("ä", "ae"))
+            if month:
+                d = _safe_date_from_parts(m.group(1), month, m.group(3))
+                if d:
+                    candidates.append((base + 120, d, line))
+
+    # Zusätzlicher globaler Fallback: Datum unten rechts/letzte Zeile mit Uhrzeit, auch wenn OCR alles in eine Zeile klebt.
+    tail = " ".join(lines[-10:])
+    for m in re.finditer(r"\b\d{1,2}:\d{2}\b\s+([0-3]?\d)\s*[./,;:\- ]\s*([O0]?[1-9]|1[0-2])\s*[./,;:\- ]\s*(20\d{2}|\d{2})\b", tail, re.I):
+        d = _safe_date_from_parts(m.group(1), m.group(2), m.group(3))
         if d:
-            return d
-    return None
+            candidates.append((700, d, "tail-time-date"))
+    return candidates
+
+
+def find_date(text: str):
+    candidates = _date_candidates(text)
+    if not candidates:
+        return None
+    # Höchster Score gewinnt. Bei Gleichstand frühere echte Rechnungsdatumszeile vor Zahlungsdatum.
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 # ------------------------- Rechnungsnummer -------------------------
 def find_invoice_number(text: str) -> Optional[str]:
@@ -502,35 +521,81 @@ def find_vat(text: str) -> Optional[Decimal]:
     return None
 
 # ------------------------- Lieferant/Zahlung -------------------------
-def find_vendor(text: str) -> Optional[str]:
-    text = _normalize_ocr_text(text)
+def _vendor_candidates(text: str) -> list[tuple[int, str, str]]:
+    text = _normalize_ocr_text(text or "")
     raw_lines = _lines(text)
     lines = [_clean_vendor_line(l) for l in raw_lines if _clean_vendor_line(l)]
     full = "\n".join(lines).lower()
+    candidates: list[tuple[int, str, str]] = []
+
+    # Starke Handelsnamen + häufige OCR-Varianten. Keine Einzellogik pro Bon, sondern generische Merchant-Lexikon-Erkennung.
     known = [
-        ("vodafone", "Vodafone West GmbH"), ("telekom", "Deutsche Telekom"), ("o2", "O2"),
-        ("netto", "Netto Marken-Discount"), ("marken-discount", "Netto Marken-Discount"),
-        ("hem", "HEM Tankstelle"), ("aral", "ARAL"), ("shell", "Shell"), ("esso", "Esso"), ("jet", "JET"),
-        ("totalenergies", "TotalEnergies"), ("avia", "AVIA"), ("edeka", "EDEKA"), ("rewe", "REWE"),
-        ("lidl", "Lidl"), ("aldi", "ALDI"), ("kaufland", "Kaufland"), ("dm-drogerie", "dm-drogerie markt"),
-        ("rossmann", "Rossmann"), ("ikea", "IKEA"), ("amazon", "Amazon"),
+        (["vodafone", "vodaf0ne"], "Vodafone West GmbH"),
+        (["telekom", "deutsche telekom"], "Deutsche Telekom"),
+        (["netto", "nefto", "netfo", "marken-discount", "netto-online", "netto ohline"], "Netto Marken-Discount"),
+        (["hem", "hem tankstelle"], "HEM Tankstelle"),
+        (["aral"], "ARAL"), (["shell"], "Shell"), (["esso"], "Esso"), (["jet tankstelle", " jet "], "JET"),
+        (["totalenergies", "total energies"], "TotalEnergies"), (["avia"], "AVIA"),
+        (["edeka"], "EDEKA"), (["rewe"], "REWE"), (["lidl"], "Lidl"), (["aldi"], "ALDI"),
+        (["kaufland"], "Kaufland"), (["dm-drogerie", "dm drogerie"], "dm-drogerie markt"),
+        (["rossmann"], "Rossmann"), (["ikea"], "IKEA"), (["amazon"], "Amazon"),
+        (["obi"], "OBI"), (["hornbach"], "Hornbach"), (["bauhaus"], "BAUHAUS"),
+        (["metro"], "METRO"), (["penny"], "PENNY"), (["norma"], "NORMA"), (["real"], "real"),
+        (["burger king"], "Burger King"), (["mcdonald"], "McDonald's"), (["starbucks"], "Starbucks"),
+        (["o2", "telefonica"], "O2"),
     ]
-    for needle, name in known:
-        if needle in ["o2", "jet", "dm"]:
-            if re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])", full):
-                return name
-        elif needle in full:
-            return name
+    for needles, name in known:
+        for needle in needles:
+            n = needle.strip().lower()
+            if len(n) <= 3:
+                if re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", full):
+                    candidates.append((900, name, f"known:{needle}"))
+            elif n in full:
+                candidates.append((950, name, f"known:{needle}"))
+
+    # Fuzzy Logo-/Kopfbereich: die ersten 12 Zeilen sind bei Kassenbons fast immer Händler/Adresse.
+    try:
+        from difflib import SequenceMatcher
+        brand_words = {
+            "netto": "Netto Marken-Discount", "vodafone": "Vodafone West GmbH", "telekom": "Deutsche Telekom",
+            "edeka": "EDEKA", "rewe": "REWE", "lidl": "Lidl", "aldi": "ALDI", "kaufland": "Kaufland",
+            "rossmann": "Rossmann", "hem": "HEM Tankstelle", "aral": "ARAL", "shell": "Shell", "esso": "Esso"
+        }
+        for idx, line in enumerate(lines[:12]):
+            low = re.sub(r"[^a-z0-9äöüß]", "", line.lower())
+            for brand, canonical in brand_words.items():
+                ratio = SequenceMatcher(None, low[:max(len(brand)+3, 8)], brand).ratio()
+                if ratio >= 0.72:
+                    candidates.append((780 - idx * 10, canonical, f"fuzzy:{line}"))
+    except Exception:
+        pass
+
+    # Juristische Firmennamen sind sehr stark, aber Kopfzeilen bevorzugen.
     legal_forms = ["gmbh", "ug", "gbr", "ag", "kg", "ohg", "e.k", "mbh", "ltd"]
-    for line in lines[:35]:
-        if any(form in line.lower() for form in legal_forms):
-            return line
-    bad = ["rechnung", "invoice", "datum", "seite", "betrag", "summe", "total", "kundenbeleg", "terminal", "beleg", "www", ".de", ".com", "straße", "strasse", "telefon", "tel", "fax", "ust", "steuer", "iban", "bic", "bon", "kasse", "kundenservice", "käufer", "zahlungsmethode"]
-    for line in lines[:10]:
+    for idx, line in enumerate(lines[:35]):
+        low = line.lower()
+        if any(form in low for form in legal_forms):
+            # Adress-/Servicezeilen abwerten
+            score = 760 - idx * 3
+            if any(b in low for b in ["kundenservice", "postfach", "amtsgericht", "hrb", "sitz der gesellschaft"]):
+                score -= 300
+            candidates.append((score, line, f"legal:{line}"))
+
+    bad = ["rechnung", "invoice", "datum", "seite", "betrag", "summe", "total", "kundenbeleg", "terminal", "beleg", "www", ".de", ".com", "straße", "strasse", "allee", "platz", "telefon", "tel", "fax", "ust", "steuer", "iban", "bic", "bon", "kasse", "kundenservice", "käufer", "zahlungsmethode", "transaktion", "tse", "seriennr"]
+    for idx, line in enumerate(lines[:10]):
         low = line.lower()
         if 3 <= len(line) <= 60 and not any(k in low for k in bad) and len(re.findall(r"\d", line)) <= 4 and re.search(r"[A-Za-zÄÖÜäöüß]{3,}", line):
-            return line.strip(" ,")
-    return None
+            # erste Logo-/Header-Zeile ist bei unbekannten Händlern der beste Fallback
+            candidates.append((520 - idx * 15, line.strip(" ,"), f"header:{line}"))
+    return candidates
+
+
+def find_vendor(text: str) -> Optional[str]:
+    candidates = _vendor_candidates(text)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
 def detect_payment_method(text: str) -> tuple[Optional[str], Optional[str]]:
@@ -648,8 +713,13 @@ def _merge_ai_fields(local: dict, ai: Optional[dict]) -> dict:
     if not ai:
         return local
     merged = dict(local)
-    # Textfelder: KI darf ergänzen, aber lokale klare Anbieter/Rechnungsnummer behalten.
-    for key in ["vendor", "invoice_date", "invoice_number", "currency"]:
+    # Textfelder: KI darf ergänzen. Datum/Lieferant dürfen überschrieben werden, wenn lokal leer oder offensichtlich schwach.
+    weak_vendors = {"o2", "02", "kan disgauni", "disgauni", "unknown", "unbekannt"}
+    if ai.get("vendor") and (not merged.get("vendor") or str(merged.get("vendor")).strip().lower() in weak_vendors or len(str(merged.get("vendor"))) <= 3):
+        merged["vendor"] = ai.get("vendor")
+    if ai.get("invoice_date") and not merged.get("invoice_date"):
+        merged["invoice_date"] = ai.get("invoice_date")
+    for key in ["invoice_number", "currency"]:
         if not merged.get(key) and ai.get(key):
             merged[key] = ai.get(key)
     # Geldfelder: KI darf nur überschreiben, wenn lokal leer oder nah am lokalen Wert. Verhindert 27.04.2026 -> 2704.00.
@@ -714,6 +784,14 @@ def extract_fields(text: str, file_path: str | None = None, content_type: str | 
     }
     ai_fields = ai_document_extraction(text, file_path=file_path, content_type=content_type)
     merged = _merge_ai_fields(local_fields, ai_fields)
+
+    # Finale Plausibilitätskorrektur: starker lokaler Lieferant/Datum aus Regelwerk gewinnt gegen schwache KI-Antworten.
+    strong_vendor = find_vendor(text)
+    if strong_vendor and (not merged.get("vendor") or str(merged.get("vendor")).strip().lower() in {"o2", "02", "unbekannt", "unknown"}):
+        merged["vendor"] = strong_vendor
+    strong_date = find_date(text)
+    if strong_date:
+        merged["invoice_date"] = strong_date
 
     # Nach finalen Extraktionswerten Kontierung nochmal sauber berechnen.
     final_booking = rule_based_skr03(text, merged.get("vendor"), merged.get("vat_rate"))

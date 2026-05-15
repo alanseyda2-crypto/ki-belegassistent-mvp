@@ -71,6 +71,9 @@
   </form>
 
   <div class="actions">
+    <form action="/documents/{{ doc.id }}/reextract" method="post">
+      <button type="submit">Belegdaten neu auslesen</button>
+    </form>
     <form action="/documents/{{ doc.id }}/ai-booking" method="post">
       <button type="submit">KI-Vorschlag neu berechnen</button>
     </form>

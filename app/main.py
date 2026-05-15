@@ -305,6 +305,31 @@ def recalc_ai_booking(document_id: int, db: Session = Depends(get_db)):
     db.commit()
     return RedirectResponse(url=f"/documents/{document_id}", status_code=303)
 
+@app.post("/documents/{document_id}/reextract")
+def reextract_document(document_id: int, db: Session = Depends(get_db)):
+    doc = db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Beleg nicht gefunden")
+    ocr_text = extract_text(doc.file_path, doc.file_type or "")
+    fields = extract_fields(ocr_text, doc.file_path, doc.file_type or "")
+    doc.ocr_text = ocr_text
+    if fields.get("net_amount") is None and fields.get("gross_amount") is not None and fields.get("vat_amount") is not None:
+        try:
+            fields["net_amount"] = (fields.get("gross_amount") - fields.get("vat_amount")).quantize(Decimal("0.01"))
+        except Exception:
+            pass
+    field_map = [
+        "invoice_date", "vendor", "invoice_number", "gross_amount", "net_amount", "vat_amount", "vat_rate",
+        "currency", "booking_category", "account", "contra_account", "payment_method", "vat_key",
+        "booking_text", "booking_confidence"
+    ]
+    for key in field_map:
+        if key in fields:
+            set_with_audit(db, doc, key, fields.get(key), source="reextract")
+    set_with_audit(db, doc, "status", "erkannt" if fields.get("invoice_date") or fields.get("gross_amount") else "prüfen", source="reextract")
+    db.commit()
+    return RedirectResponse(url=f"/documents/{document_id}", status_code=303)
+
 
 @app.post("/documents/{document_id}/correct")
 def correct_booking(
