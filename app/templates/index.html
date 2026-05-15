@@ -17,18 +17,10 @@
 
 <section class="toolbar">
   <form method="get">
-    <label>Jahr</label>
-    <select name="year">
-      <option value="">Alle</option>
-      {% for y in available_years %}
-      <option value="{{ y }}" {% if year|string == y|string %}selected{% endif %}>{{ y }}</option>
-      {% endfor %}
-    </select>
-
-    <label>Monat</label>
+    <label>Jahr & Monat</label>
     <input type="month" name="month" value="{{ month or '' }}">
     <button type="submit">Filtern</button>
-    <a href="/" class="link-button">Zurücksetzen</a>
+    <a href="/" class="link-button">Filter zurücksetzen</a>
     <a href="/export/datev" class="link-button">DATEV-CSV alle</a>
     <a href="/export/datev?confirmed_only=true" class="link-button">DATEV-CSV bestätigt</a>
     <a href="/rules" class="link-button">Lernregeln</a>
